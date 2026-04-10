@@ -9,10 +9,15 @@ from scipy.interpolate import InterpolatedUnivariateSpline
 import numpy as np
 import math
 import time
-from scipy.special import erf
-import mpmath
+from scipy.special import erf, exp1
 from scipy import integrate
 from tqdm import trange
+
+CUMTRAPZ = (
+    integrate.cumulative_trapezoid
+    if hasattr(integrate, "cumulative_trapezoid")
+    else integrate.cumtrapz
+)
 
 
 def print_progress(iteration, total, offset=0):
@@ -51,11 +56,12 @@ def DFThxcmodel(path):
     
     w = f['xyz'][:,3]
     f.close()
-    Ntot = np.sum(np.dot(w, (na+nb)))
-    Na   = np.sum(np.dot(w, (na)))
-    Nb   = np.sum(np.dot(w, (nb)))
-    print("N_up: ", np.sum(np.dot(w, (na))))
-    print("N_down: ", np.sum(np.dot(w, (nb))))   
+    density_total = na + nb
+    Ntot = np.dot(w, density_total)
+    Na = np.dot(w, na)
+    Nb = np.dot(w, nb)
+    print("N_up: ", Na)
+    print("N_down: ", Nb)
     print("N_tot: ", Ntot)      
     ###### Exact density
     '''
@@ -91,11 +97,9 @@ def DFThxcmodel(path):
 #     print("sumrule hc  ", np.sum(4*np.pi*axis**2*(hcss  + hcos)) * delta_u)
 
 
-    vabs = lambda a,b: np.sum(np.multiply(a,b),axis=0)
-    
-    gaa = np.array(list(map(vabs, ga, ga))) # |grad|^2 spin 0
-    gbb = np.array(list(map(vabs, gb, gb))) # |grad|^2 spin 1
-    gab = np.array(list(map(vabs, ga, gb)))
+    gaa = np.einsum('ij,ij->i', ga, ga) # |grad|^2 spin 0
+    gbb = np.einsum('ij,ij->i', gb, gb) # |grad|^2 spin 1
+    gab = np.einsum('ij,ij->i', ga, gb)
     gtt = gaa + gbb + 2*gab
     
     #print(gtt) 
@@ -104,13 +108,18 @@ def DFThxcmodel(path):
     delta_u = 0.0125
     #u = np.linspace(0,axis[-1],npts)           
     #u[0]=1e-6
-    u=1
     print("npts points: ", npts)
     print("u range: 0~", (npts-1) * delta_u)
 
-    kf = (3*math.pi**2*(na+nb))**(1/3)
+    u_x = np.linspace(0, (npts - 1) * delta_u, npts)
+    u_exchange = u_x.copy()
+    u_exchange[0] = 1e-6
+    u = u_x.copy()
+    u[0] = 1e-10
+
+    kf = (3*math.pi**2*density_total)**(1/3)
     #r = np.linspace(0,5,101)
-    s = np.sqrt(gtt)/(2*kf*(na+nb))
+    s = np.sqrt(gtt)/(2*kf*density_total)
     s_2a = 2*np.sqrt(gaa)/(2*(3*math.pi**2*(na*2))**(1/3)*(na*2))
     s_2b = 2*np.sqrt(gbb)/(2*(3*math.pi**2*(nb*2))**(1/3)*(nb*2))
     
@@ -127,14 +136,14 @@ def DFThxcmodel(path):
     D_gga = 0.57786348
     E_gga = -0.051955731
     
-    hx_lda = [0]*npts
-    hx_pbe = [0]*npts
+    hx_lda = np.zeros(npts)
+    hx_pbe = np.zeros(npts)
 
-    hc_lda = [0]*npts
-    hc_pbe = [0]*npts
+    hc_lda = np.zeros(npts)
+    hc_pbe = np.zeros(npts)
     
-    rs   = (3/(4*np.pi*(na+nb)))**(1/3)
-    zeta = (na-nb)/(na+nb)
+    rs   = (3/(4*np.pi*density_total))**(1/3)
+    zeta = (na-nb)/density_total
     ks   = (4*kf/np.pi)**(0.5)
 
     def reduced_density_gradient(gradn, kf, n):
@@ -213,32 +222,24 @@ def DFThxcmodel(path):
     def J_lda(x):
         out = (-A_gga/x**2)*(1/(1+(4/9)*A_gga*x**2))+(A_gga/x**2+B_gga+C_gga*x**2+E_gga*x**4)*np.exp(-D_gga*x**2)
         return out
-    
-    #progress_bar = tqdm(total=npts)
-    #for i in range(npts):
-    for i in range(npts):
-#         delta_u = axis[-1] - axis[-2]
-        if i == 0:
-            u = 1e-6
-        else:
-            u = i * delta_u
-    
-        #y = u*kf
 
-        # apply spin scaling
-        hx_lda[i] = np.sum(np.dot(w,(2*na)**2*J_lda((1+zeta)**(1/3)*kf*u) + (2*nb)**2*J_lda((1-zeta)**(1/3)*kf*u))) /  (2*Ntot)
-        hx_pbe[i] = np.sum(np.dot(w,(2*na)**2*J_gga(s_2a, (1+zeta)**(1/3)*kf*u) + (2*nb)**2*J_gga(s_2b, (1-zeta)**(1/3)*kf*u))) /  (2*Ntot)
-        #progress_bar.update(1)
-        print_progress(i+1, npts-1)
+    spin_scale_up = (1 + zeta)**(1/3) * kf
+    spin_scale_down = (1 - zeta)**(1/3) * kf
+    x_up = np.outer(u_exchange, spin_scale_up)
+    x_down = np.outer(u_exchange, spin_scale_down)
+    density_up = (2 * na)**2
+    density_down = (2 * nb)**2
 
-        #progress_bar.set_description(f"Iteration: {i}")
+    hx_lda = (
+        (J_lda(x_up) * density_up + J_lda(x_down) * density_down) @ w
+    ) / (2 * Ntot)
+    hx_pbe = (
+        (J_gga(s_2a[np.newaxis, :], x_up) * density_up +
+         J_gga(s_2b[np.newaxis, :], x_down) * density_down) @ w
+    ) / (2 * Ntot)
 
-    #progress_bar.close()
     print(" ") 
-    u_x = np.linspace(0,(npts-1)*delta_u,npts)
-    #hx_lda = np.einsum('i,ai->a', w, (2*na)**2*J_lda(np.outer(u, (1+zeta)**(1/3)*kf)) + (2*nb)**2*J_lda(np.outer(u, (1-zeta)**(1/3)*kf))) /  (2*Ntot)
     print("hx_lda finish")
-    #hx_pbe = np.einsum('i,ai->a', w, (2*na)**2*J_gga(s_2a, np.outer(u, (1+zeta)**(1/3)*kf)) + (2*nb)**2*J_gga(s_2b, np.outer(u,(1-zeta)**(1/3)*kf))) /  (2*Ntot)
     print("hx pbe finish")
     #print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe))
     print("X hole finish")
@@ -250,12 +251,8 @@ def DFThxcmodel(path):
     #u = np.linspace(0,axis[-1],npts)
     #print("size",len(hx_lda),len(hx_pbe))
 
-    rs   = (3/(4*np.pi*(na+nb)))**(1/3)
-    zeta = (na-nb)/(na+nb)
-    ks   = (4*kf/np.pi)**(0.5)
-    
     phi  = 0.5*((1+zeta)**(2/3)+(1-zeta)**(2/3))
-    t    = np.sqrt(gtt)/(2*ks*phi*(na+nb))
+    t    = np.sqrt(gtt)/(2*ks*phi*density_total)
     ####
     a1 = -0.1244
     a2 = 0.027032
@@ -279,9 +276,25 @@ def DFThxcmodel(path):
         return f
     
     def G(rs_tmp,A,alpha1,beta1,beta2,beta3,beta4,P):
-        G = -2*A*(1+alpha1*rs_tmp)*np.log(1+1/(2*A*(beta1*rs**(1/2)+beta2*rs+beta3*rs**(3/2)+beta4*rs**(P+1))))
+        G = -2*A*(1+alpha1*rs_tmp)*np.log(1+1/(2*A*(beta1*rs_tmp**(1/2)+beta2*rs_tmp+beta3*rs_tmp**(3/2)+beta4*rs_tmp**(P+1))))
         return G
-    
+
+    def scaled_exp1(x):
+        x = np.asarray(x, dtype=float)
+        out = np.empty_like(x)
+        large = x > 50
+        small = ~large
+
+        if np.any(small):
+            x_small = x[small]
+            out[small] = x_small * np.exp(x_small) * exp1(x_small)
+
+        if np.any(large):
+            inv_x = 1 / x[large]
+            out[large] = 1 - inv_x + 2 * inv_x**2 - 6 * inv_x**3
+
+        return out
+
     ec_0 = G(rs, 0.031091, 0.21370, 7.5957, 3.5876, 1.6382, 0.49294, 1)
     ec_1 = G(rs, 0.015545, 0.20548, 14.1189, 6.1977, 3.3662, 0.62517, 1)
     alpha_c = -G(rs, 0.016887, 0.11125, 10.357, 3.6231, 0.88026, 0.49671, 1)
@@ -309,243 +322,49 @@ def DFThxcmodel(path):
             -22.836*phi**(-3)*ec*p**2.5
 
     print("LDA C hole starts")
-    
-    #progress_bar = tqdm(total=npts)
 
-    for i in range(npts):
-#         delta_u = axis[-1] - axis[-2]
-        if i == 0:
-            u = 1e-10
-        else:
-            u = i * delta_u
+    v = np.outer(u, phi * ks)
+    v_sq = v**2
+    radial_scale = np.outer(u, kf / phi)
+    exp_factor = np.exp(-d[np.newaxis, :] * radial_scale**2)
 
-    ########### GGA  C hole    ############
-        v    = phi*ks*u
-        #print(i)
-        R    = u
-    #print((v**2).size)
-    
-        f1 = (a1 + a2*v + a3*v**2) / (1 + b1*v + b2*v**2 + b3*v**3 + b4*v**4)
-        f2 = (-a1 - (a2-a1*b1)*v + c1*v**2 + c2*v**3 + c3*v**4 + c4*v**5) * np.exp(- d*(kf*R/phi)**2)
-        #print(f1.size)
-        #f1 = 2*f1bar+0.5*v*((a2+2*a3*v)(1+b1*v+b2*v**2+b3*v**3+b4*v**4)-(a1+a2*v+a3*v**2)(b1+2*b2*v+3*b3*v**2+4*b4*v*3))/(1+b1*v+b2*v**2+b3*v**3+b4*v**4)**2
-    
-        Ac = 1/(4*np.pi*v**2)*(f1+f2)
-    
-        #print(Ac)
-    
-       #def E1(x):
-       #    return x*np.exp(x)*mpmath.gammainc(0, x)
-    
-       ##np.array(map(E1, p))
-    
-       #beta = 2*p**2/(3*np.pi**2)*(1-np.array([E1(12*v) for v in p])) 
-       #BcLM = (18*np.pi**3*(1+v**2/12)**2)**(-1)
-       #Bc = BcLM*(1-np.exp(-p*v**2)) + beta*v**2*np.exp(-p*v**2)
-    
-        nc_lda = phi**5*ks**2*Ac
-    
-       # F = 4*np.pi*v**2*(Ac + t**2*Bc)
-    
-        hc_lda[i] = np.sum(np.dot(w,nc_lda*(na+nb)))
-        
-        print_progress(i + 1, npts-1)
-        
-        #progress_bar.update(1)
-        #progress_bar.set_description(f"Iteration: {i}")
-    
-    #print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe))
-    #progress_bar.close()
-    print(" ")
-    print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe)) 
- 
-    u = np.zeros(npts)
-    for i in range(npts):
-        if i == 0:
-            u[i] = 1e-10
-        else:
-            u[i] = i * delta_u
+    f1 = (a1 + a2*v + a3*v_sq) / (1 + b1*v + b2*v_sq + b3*v**3 + b4*v**4)
+    f2 = (
+        -a1 - (a2-a1*b1)*v + c1*v_sq + c2*v**3 + c3*v**4 + c4*v**5
+    ) * exp_factor
+    Ac = (f1 + f2) / (4 * np.pi * v_sq)
 
-    u = np.transpose(u)
-    
-    ########### GGA  C hole  ############
-    rs   = (3/(4*np.pi*(na+nb)))**(1/3)
-    zeta = (na-nb)/(na+nb)
-    ks   = (4*kf/np.pi)**(0.5)
-    
-    phi  = 0.5*((1+zeta)**(2/3)+(1-zeta)**(2/3))
-    t    = np.sqrt(gtt)/(2*ks*phi*(na+nb))
-    
-    v    = phi*np.outer(u,ks)
-    
-    #print(v[:,j].max)
-    R    = u
-    #print((v[:,j]**2).size)
-    
-    ########
-    a1 = -0.1244
-    a2 = 0.027032
-    a3 = 0.0024317
-    b1 = 0.2199
-    b2 = 0.086664
-    b3 = 0.012858
-    b4 = 0.0020
-    
-    alpha = 0.193
-    beta  = 0.525
-    gamma = 0.3393
-    delta = 0.9
-    epsilon = 0.10161
-    kapa =(4/(3*np.pi))*(9*np.pi/4)**(1/3)
-    
-    #########
-    d  = 0.305-0.136*zeta*zeta
-    p  = np.pi*kf*d/(4*phi**4)
-    
-    
-    
-    def f(z):
-        f = ((1+z)**(4/3)+(1-z)**(4/3)-2)/(2**(4/3)-2)
-        return f
-    
-    def G(rs_tmp,A,alpha1,beta1,beta2,beta3,beta4,P):
-        G = -2*A*(1+alpha1*rs_tmp)*np.log(1+1/(2*A*(beta1*rs**(1/2)+beta2*rs+beta3*rs**(3/2)+beta4*rs**(P+1))))
-        return G
-    
-    def ldaJ(y):
-        A = 0.59
-        B = -0.54354
-        C = 0.027678
-        D = 0.18843
-        
-        return -A/y**2*1/(1+4/9*A*y**2)+((A/y**2)+B+C*y**2)*np.exp(-D*y**2)
-    
-    def findvc(x):
-        vc = 0
-        Fint = integrate.cumtrapz(v[:,j]**2*x, v[:,j], initial=0)
-        #print("Fintsize",Fint.size)
-        for i in range(v[:,j].size-3,-1,-1):
-            #print(Fint[i]*Fint[i-1])
-            if (Fint[i]*Fint[i-1]<0):
-                vc = v[i,j]
-                #vc = v[i+2,j]
-                #print("vc=",vc)
-                break
-        #print(vc)
-        return vc
-    ''' 
-    def findvc(x):
-        vc = v[-1,j]
-        Fint = integrate.cumtrapz(v[:,j]**2*x, v[:,j], initial=0)
-        #print(Fint.size)
-        for i in range(v[:,j].size-1,-1,-1):
-            #print(Fint[i]*Fint[i-1])
-            if (Fint[i]*Fint[i-1]<=0) & (Fint[i]>=0):
-                
-                vc = v[i,j]
-                #print(vc)
-                break
-            elif Fint[i]<=0:
-                
-                vc = v[i,j]
-                #print(vc)
-                break
-        return vc   
-    '''
-    ec_0 = G(rs, 0.031091, 0.21370, 7.5957, 3.5876, 1.6382, 0.49294, 1)
-    ec_1 = G(rs, 0.015545, 0.20548, 14.1189, 6.1977, 3.3662, 0.62517, 1)
-    alpha_c = -G(rs, 0.016887, 0.11125, 10.357, 3.6231, 0.88026, 0.49671, 1)
-    
-    ec = ec_0 + alpha_c*f(zeta)/1.709921*(1-zeta**4) + (ec_1 - ec_0)*f(zeta)*zeta**4
-    
-    c1 = -0.0012529\
-            + 0.1244*p\
-            + 0.61386*(1-zeta**2)/(phi**5*rs**2)*((1+alpha*rs)/(1+beta*rs+alpha*beta*rs**2)-1)
-    c2 = 0.0033894-0.054388*p\
-            + 0.39270*(1-zeta**2)/(phi**6*rs**1.5)*((1+gamma*rs)/(2+delta*rs+epsilon*rs**2))*((1+alpha*rs)/(1+beta*rs+alpha*beta*rs**2))
-    c3 = 0.10847*p**2.5\
-            + 1.4604*p**2\
-            + 0.51749*p**1.5\
-            - 3.5297*c1*p\
-            - 1.9030*c2*p**0.5\
-            + 1.0685*p**2*np.log(p)\
-            + 34.356*phi**(-3)*ec*p**2
-    c4 = -0.081596*p**3\
-            -1.0810*p**2.5\
-            -0.31677*p**2\
-            +1.9030*c1*p**1.5\
-            +0.76485*c2*p\
-            -0.71019*p**2.5*np.log(p)\
-            -22.836*phi**(-3)*ec*p**2.5
-    
-    nc_gga = np.zeros((na.size,npts))
-    nc_lsd = np.zeros((na.size,npts))
+    phi_ks_factor = (phi**5 * ks**2)[np.newaxis, :]
+    nc_lsd = phi_ks_factor * Ac
+    hc_lda = ((nc_lsd * density_total[np.newaxis, :]) @ w) / Ntot
+
+    beta_rs = 2 * p**2 / (3 * np.pi**3) * (1 - scaled_exp1(12 * p))
+    BcLM = (18*np.pi**3*(1+v_sq/12)**2)**(-1)
+    decay = np.exp(-p[np.newaxis, :] * v_sq)
+    Bc = BcLM * (1 - decay) + beta_rs[np.newaxis, :] * v_sq * decay
+
+    gga_hole = Ac + (t**2)[np.newaxis, :] * Bc
+    nc_gea = phi_ks_factor * gga_hole
+
+    # Keep the last sign change in the cumulative integral for each grid column.
+    Fint = CUMTRAPZ(v_sq * gga_hole, v, axis=0, initial=0)
+    sign_change = Fint[1:-2] * Fint[:-3] < 0
+    candidate_rows = np.arange(1, npts - 2)[:, np.newaxis]
+    last_crossing = np.max(np.where(sign_change, candidate_rows, 0), axis=0)
+    vc = np.zeros_like(phi)
+    crossing_cols = np.nonzero(last_crossing)[0]
+    vc[crossing_cols] = v[last_crossing[crossing_cols], crossing_cols]
+
+    nc_gga = np.where(v < vc[np.newaxis, :], nc_gea, 0.0)
+
     print(" ")
     print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe))
-  
-    #progress_bar = tqdm(total=na.size) 
-    #range(na.size)[4000, 10000, 30000 ,54577]
-    for j in range(na.size):
-        f1 = (a1 + a2*v[:,j] + a3*v[:,j]**2) / (1 + b1*v[:,j] + b2*v[:,j]**2 + b3*v[:,j]**3 + b4*v[:,j]**4)
-        f2 = (-a1 - (a2-a1*b1)*v[:,j] + c1[j]*v[:,j]**2 + c2[j]*v[:,j]**3 + c3[j]*v[:,j]**4 + c4[j]*v[:,j]**5)\
-        * np.exp(- d[j]*(kf[j]*R/phi[j])**2)
-        #print(f1.size)
-    #f1 = 2*f1bar+0.5*v[:,j]*((a2+2*a3*v[:,j])(1+b1*v[:,j]+b2*v[:,j]**2+b3*v[:,j]**3+b4*v[:,j]**4)-(a1+a2*v[:,j]+a3*v[:,j]**2)(b1+2*b2*v[:,j]+3*b3*v[:,j]**2+4*b4*v[:,j]*3))/(1+b1*v[:,j]+b2*v[:,j]**2+b3*v[:,j]**3+b4*v[:,j]**4)**2
-    
-    
-        Ac = 1/(4*np.pi*v[:,j]**2)*(f1+f2)
-    
-        #print("rs = ", rs[j], "zeta = ", zeta[j], "t = ", t[j])
-    
-        def E1(x):
-            return x*np.exp(x)*mpmath.gammainc(0, x)
-    
-        #np.array(map(E1, p)) np.array([E1(12*p[j]) for v[:,j] in p]
-    
-        beta_rs = 2*p[j]**2/(3*np.pi**3)*(1-E1(12*p[j]))
-        BcLM = (18*np.pi**3*(1+v[:,j]**2/12)**2)**(-1)
-        Bc = BcLM*(1-np.exp(-p[j]*v[:,j]**2))\
-        + beta_rs*v[:,j]**2*np.exp(-p[j]*v[:,j]**2)
-    
-        nc_lsd[j] = phi[j]**5*ks[j]**2*Ac
-
-        #nc_lsd2 = kapa**(-1)*phi[j]**3*rs[j]*(f1+f2)/(kf[j]*R)**2
-        nc_gea = phi[j]**5*ks[j]**2*(Ac + t[j]**2*Bc)
-        
-        #print('Ac', Ac, 'nc_gea', nc_gea.size, 'nc_lsd', nc_lsd, 'v', v.shape)
-        
-        #F_gea_int = integrate.cumtrapz(4*np.pi*v[:,j]**2*nc_gea/(phi[j]*ks[j])**2, v[:,j], initial=0)
-        vc = findvc(Ac + t[j]**2*Bc)
-        #print(vc)
-        nc_gga[j] = nc_gea*np.heaviside(vc-v[:,j], 0)
-        #print(j,w.size)
-        print_progress(j + 1, (na.size // 10)*10)
-        #progress_bar.update(1)
-        #print(v.shape, nc_gga.shape, nc_gea.size, na.shape, w.shape)
-    
-        #F = 4*np.pi*v[:,j]**2*(Ac + t[j]**2*Bc)
-    
-        
-        #vc[j] = find_max_int1(F_int)
-    
-    #nn = nc_gga.T*(na+nb)
-    #print(nn.shape)
-    #progress_bar.close()
     print(" ")
-    hc_lda = np.dot(nc_lsd.T*(na+nb), w)/Ntot
-    hc_pbe = np.dot(nc_gga.T*(na+nb), w)/Ntot
-    
-    #u = np.linspace(0,5,npts)
-    u = u.T
+    hc_pbe = ((nc_gga * density_total[np.newaxis, :]) @ w) / Ntot
+
     print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe))
-    
-    hx_lda = np.array(hx_lda)
-    hc_lda = np.array(hc_lda)
     hxc_lda= hx_lda + hc_lda
 
-
-    hx_pbe = np.array(hx_pbe)
-    hc_pbe = np.array(hc_pbe)
     hxc_pbe= hx_pbe + hc_pbe
 
 
@@ -584,13 +403,13 @@ def DFThxcmodel(path):
     ofile = open(f'XChole_energy_{after}.txt','w')
 
 
-    ex_lda  = integrate.cumtrapz(4 * np.pi * hx_lda * u, u, initial=0)
-    ec_lda  = integrate.cumtrapz(4 * np.pi * hc_lda * u, u, initial=0)
-    exc_lda = integrate.cumtrapz(4 * np.pi * (hx_lda + hc_lda) * u, u, initial=0)
+    ex_lda  = CUMTRAPZ(4 * np.pi * hx_lda * u, u, initial=0)
+    ec_lda  = CUMTRAPZ(4 * np.pi * hc_lda * u, u, initial=0)
+    exc_lda = CUMTRAPZ(4 * np.pi * (hx_lda + hc_lda) * u, u, initial=0)
 
-    ex_pbe  = integrate.cumtrapz(4 * np.pi * hx_pbe * u, u, initial=0)
-    ec_pbe  = integrate.cumtrapz(4 * np.pi * hc_pbe * u, u, initial=0)
-    exc_pbe = integrate.cumtrapz(4 * np.pi * (hx_pbe + hc_pbe) * u, u, initial=0)
+    ex_pbe  = CUMTRAPZ(4 * np.pi * hx_pbe * u, u, initial=0)
+    ec_pbe  = CUMTRAPZ(4 * np.pi * hc_pbe * u, u, initial=0)
+    exc_pbe = CUMTRAPZ(4 * np.pi * (hx_pbe + hc_pbe) * u, u, initial=0)
     
     print("E_LDA", ex_lda[-1], ec_lda[-1], exc_lda[-1])
     print("E_PBE", ex_pbe[-1], ec_pbe[-1], exc_pbe[-1])
