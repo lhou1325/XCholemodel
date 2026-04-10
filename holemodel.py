@@ -18,14 +18,57 @@ CUMTRAPZ = (
     if hasattr(integrate, "cumulative_trapezoid")
     else integrate.cumtrapz
 )
+TRAPEZOID = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
 
 RHO_FLOOR = 1e-18
+DENOM_FLOOR = 1e-30
+RADIAL_FLOOR = 1e-14
+MAX_NEGEXP_ARGUMENT = 700.0
 PBE_S_REGULARIZATION_START = 8.0
 PBE_S_REGULARIZATION_LIMIT = 11.0
 
 
 def safe_clip_density(rho):
     return np.clip(rho, 0.0, None)
+
+
+def finite_or_zero(values):
+    return np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def safe_divide(numerator, denominator, fill=0.0, where=None, min_abs_denominator=DENOM_FLOOR):
+    numerator, denominator = np.broadcast_arrays(
+        np.asarray(numerator, dtype=float),
+        np.asarray(denominator, dtype=float),
+    )
+    result = np.full(numerator.shape, fill, dtype=float)
+    valid = np.abs(denominator) > min_abs_denominator
+    if where is not None:
+        valid &= np.broadcast_to(where, numerator.shape)
+    np.divide(numerator, denominator, out=result, where=valid)
+    return finite_or_zero(result)
+
+
+def safe_inverse_square(x, where=None, min_abs_x=RADIAL_FLOOR):
+    x = np.asarray(x, dtype=float)
+    result = np.zeros_like(x, dtype=float)
+    valid = np.abs(x) > min_abs_x
+    if where is not None:
+        valid &= np.broadcast_to(where, x.shape)
+    np.divide(1.0, x * x, out=result, where=valid)
+    return finite_or_zero(result)
+
+
+def safe_negexp(argument):
+    return np.exp(-np.clip(np.asarray(argument, dtype=float), 0.0, MAX_NEGEXP_ARGUMENT))
+
+
+def trapz_integral(y, x):
+    return float(finite_or_zero(TRAPEZOID(finite_or_zero(y), x=x)))
+
+
+def cumulative_integral(y, x):
+    return finite_or_zero(CUMTRAPZ(finite_or_zero(y), x, initial=0))
 
 
 def regularize_reduced_gradient(s, s1=PBE_S_REGULARIZATION_START, s2=PBE_S_REGULARIZATION_LIMIT):
@@ -76,8 +119,14 @@ def DFThxcmodel(path):
     
     w = f['xyz'][:,3]
     f.close()
+    if not (na.shape == nb.shape == w.shape):
+        raise ValueError("rho and xyz datasets must share the same leading dimension.")
+    if ga.shape[0] != na.shape[0] or gb.shape[0] != na.shape[0]:
+        raise ValueError("grd dataset must align with rho along the grid dimension.")
+
     density_total = na + nb
     Ntot = np.dot(w, density_total)
+    normalizer = Ntot if Ntot > RHO_FLOOR else 1.0
     Na = np.dot(w, na)
     Nb = np.dot(w, nb)
     print("N_up: ", Na)
@@ -151,18 +200,18 @@ def DFThxcmodel(path):
 
     kf = (3 * math.pi**2 * density_safe)**(1/3)
     #r = np.linspace(0,5,101)
-    s = np.zeros_like(density_total)
-    s[active_total] = sqrt_gtt[active_total] / (2 * kf[active_total] * density_total[active_total])
-    s = regularize_reduced_gradient(s)
+    s = regularize_reduced_gradient(
+        safe_divide(sqrt_gtt, 2 * kf * density_total, where=active_total)
+    )
 
     spin_kf_up = (3 * math.pi**2 * (2 * na_safe))**(1/3)
     spin_kf_down = (3 * math.pi**2 * (2 * nb_safe))**(1/3)
-    s_2a = np.zeros_like(na)
-    s_2b = np.zeros_like(nb)
-    s_2a[active_up] = sqrt_gaa[active_up] / (spin_kf_up[active_up] * (2 * na[active_up]))
-    s_2b[active_down] = sqrt_gbb[active_down] / (spin_kf_down[active_down] * (2 * nb[active_down]))
-    s_2a = regularize_reduced_gradient(s_2a)
-    s_2b = regularize_reduced_gradient(s_2b)
+    s_2a = regularize_reduced_gradient(
+        safe_divide(sqrt_gaa, spin_kf_up * (2 * na), where=active_up)
+    )
+    s_2b = regularize_reduced_gradient(
+        safe_divide(sqrt_gbb, spin_kf_down * (2 * nb), where=active_down)
+    )
     
     #constant for GGA
     a1 = 0.00979681
@@ -184,24 +233,13 @@ def DFThxcmodel(path):
     hc_pbe = np.zeros(npts)
     
     rs = (3 / (4 * np.pi * density_safe))**(1/3)
-    zeta = np.zeros_like(density_total)
-    zeta[active_total] = (na[active_total] - nb[active_total]) / density_total[active_total]
-    zeta = np.clip(zeta, -1.0, 1.0)
+    zeta = np.clip(safe_divide(na - nb, density_total, where=active_total), -1.0, 1.0)
     ks = np.sqrt(4 * kf / np.pi)
 
-    def reduced_density_gradient(gradn, kf, n):
-        numerator = abs(gradn)
-        denominator = 2*kf*n
-        out = numerator/denominator
-        return out
-    #s1 =  reduced_density_gradient(grad_n, kf, n)
-    
-    #s = np.linspace(1e-6,6,500)
     def H_function(a,b,c,d,e,s):
         numerator = a*s**2+b*s**4
         denominator = 1+c*s**4+d*s**5+e*s**6
-        h_out = numerator/denominator
-        return h_out
+        return safe_divide(numerator, denominator)
     
     def F_function(h):
         f_out = 6.475 * h + 0.4797
@@ -213,7 +251,7 @@ def DFThxcmodel(path):
         first_term = 15*e+(6*c*(1+f*s**2)*denom_term)
         second_term = 4*b*(denom_term**2)+8*a*(denom_term**3)
         first_value = np.sqrt(math.pi)*(first_term+second_term)
-        third_term = 1/(16*denom_term**(7/2))
+        third_term = safe_divide(1.0, 16 * denom_term**(7/2))
         erfcx_arg = (3 * s / 2) * np.sqrt(h / a)
         fourth_term = (3 * math.pi * np.sqrt(a) / 4) * erfcx(erfcx_arg)
 
@@ -221,53 +259,62 @@ def DFThxcmodel(path):
         return a_out
     
     def constant_b(s,d,h):
+        h = np.clip(h, 0.0, None)
+        denom_term = np.maximum(d + h * s**2, DENOM_FLOOR)
         numerator = 15*np.sqrt(math.pi)*s**2
-        denominator = 16*(d+h*s**2)**(7/2)
-        b_out  = numerator/denominator
-        return b_out
+        denominator = 16 * denom_term**(7/2)
+        return safe_divide(numerator, denominator)
     
     def G_function(v1,v2,e):
         numerator = 0.75 * math.pi + v1
         denominator = v2 * e
-        out = np.zeros_like(numerator, dtype=float)
-        np.divide(-numerator, denominator, out=out, where=np.abs(denominator) > 0)
-        return out
+        return safe_divide(-numerator, denominator)
     
     def J_gga(s,x):
-        a1 = 0.00979681
-        a2 = 0.041083
-        a3 = 0.187440
-        a4 = 0.00120824
-        a5 = 0.0347188
-    
-        A_gga = 1.0161144
-        B_gga = -0.37170836
-        C_gga = -0.077215461
-        D_gga = 0.57786348
-        E_gga = -0.051955731
-        
-        H_gga = H_function(a1,a2,a3,a4,a5,s)
-    
-        F_gga = 6.475*H_gga+0.4797
-    #thiction is to obtain the value of G
-        a = constant_a(A_gga,B_gga,C_gga,D_gga,E_gga,H_gga,F_gga,s)
-    
-        b = constant_b(s,D_gga,H_gga)
-    
-        G_gga = G_function(a,b,E_gga)
-        #out = (-A_gga/x**2)*(1/(1+(4/9)*A_gga*x**2))*np.exp(-s**2*H_gga*x**2)\
-        #    +((A_gga/x**2)+B_gga+C_gga*(1+s**2*F_gga)*x**2+E_gga*(1+s**2*G_gga)*x**4)*(np.exp(-D_gga*x**2))*np.exp(-(s**2)*H_gga*x**2)
-        out = np.where(
-            s == 0,
-            J_lda(x),
-            (-A_gga / x**2) * (1 / (1 + (4 / 9) * A_gga * x**2)) * np.exp(-s**2 * H_gga * x**2) +
-            ((A_gga / x**2) + B_gga + C_gga * (1 + s**2 * F_gga) * x**2 + E_gga * (1 + s**2 * G_gga) * x**4) *
-            np.exp(-D_gga * x**2) * np.exp(-s**2 * H_gga * x**2)
-        )
-        return out
+        s, x = np.broadcast_arrays(np.asarray(s, dtype=float), np.asarray(x, dtype=float))
+        out = np.zeros_like(x, dtype=float)
+        valid = np.isfinite(s) & np.isfinite(x) & (np.abs(x) > RADIAL_FLOOR)
+        if not np.any(valid):
+            return out
+
+        lda_mask = valid & np.isclose(s, 0.0)
+        if np.any(lda_mask):
+            out[lda_mask] = J_lda(x[lda_mask])
+
+        gga_mask = valid & ~lda_mask
+        if np.any(gga_mask):
+            s_valid = s[gga_mask]
+            x_valid = x[gga_mask]
+            h_gga = H_function(a1, a2, a3, a4, a5, s_valid)
+            f_gga = F_function(h_gga)
+            a_val = constant_a(A_gga, B_gga, C_gga, D_gga, E_gga, h_gga, f_gga, s_valid)
+            b_val = constant_b(s_valid, D_gga, h_gga)
+            g_gga = G_function(a_val, b_val, E_gga)
+            x_sq = x_valid**2
+            inv_x_sq = safe_inverse_square(x_valid)
+            attenuation = safe_negexp(s_valid**2 * h_gga * x_sq)
+            damped = safe_negexp(D_gga * x_sq) * attenuation
+            out[gga_mask] = finite_or_zero(
+                (-A_gga * inv_x_sq) * safe_divide(1.0, 1 + (4 / 9) * A_gga * x_sq) * attenuation +
+                ((A_gga * inv_x_sq) + B_gga + C_gga * (1 + s_valid**2 * f_gga) * x_sq +
+                 E_gga * (1 + s_valid**2 * g_gga) * x_sq**2) * damped
+            )
+        return finite_or_zero(out)
     
     def J_lda(x):
-        out = (-A_gga/x**2)*(1/(1+(4/9)*A_gga*x**2))+(A_gga/x**2+B_gga+C_gga*x**2+E_gga*x**4)*np.exp(-D_gga*x**2)
+        x = np.asarray(x, dtype=float)
+        out = np.zeros_like(x, dtype=float)
+        valid = np.isfinite(x) & (np.abs(x) > RADIAL_FLOOR)
+        if not np.any(valid):
+            return out
+
+        x_valid = x[valid]
+        x_sq = x_valid**2
+        inv_x_sq = safe_inverse_square(x_valid)
+        out[valid] = finite_or_zero(
+            (-A_gga * inv_x_sq) * safe_divide(1.0, 1 + (4 / 9) * A_gga * x_sq) +
+            ((A_gga * inv_x_sq) + B_gga + C_gga * x_sq + E_gga * x_sq**2) * safe_negexp(D_gga * x_sq)
+        )
         return out
 
     spin_scale_up = (1 + zeta)**(1/3) * kf
@@ -277,30 +324,33 @@ def DFThxcmodel(path):
     density_up = (2 * na)**2
     density_down = (2 * nb)**2
 
-    hx_lda = (
+    hx_lda = finite_or_zero((
         (J_lda(x_up) * density_up + J_lda(x_down) * density_down) @ w
-    ) / (2 * Ntot)
-    hx_pbe = (
+    ) / (2 * normalizer))
+    hx_pbe = finite_or_zero((
         (J_gga(s_2a[np.newaxis, :], x_up) * density_up +
          J_gga(s_2b[np.newaxis, :], x_down) * density_down) @ w
-    ) / (2 * Ntot)
+    ) / (2 * normalizer))
 
     print(" ") 
     print("hx_lda finish")
     print("hx pbe finish")
     #print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe))
     print("X hole finish")
-    print("SUMrule ldax:", np.trapz(4 * np.pi * u_x ** 2 * hx_lda, x=u_x))
-    print("SUMrule ggax:", np.trapz(4 * np.pi * u_x ** 2 * hx_pbe, x=u_x))
-    print("Ex lda:", np.trapz(2 * np.pi * u_x * hx_lda, x=u_x))
-    print("Ex pbe:", np.trapz(2 * np.pi * u_x * hx_pbe, x=u_x))
+    sumx_lda = trapz_integral(4 * np.pi * u**2 * hx_lda, u)
+    sumx_pbe = trapz_integral(4 * np.pi * u**2 * hx_pbe, u)
+    ex_val_lda = trapz_integral(2 * np.pi * u_x * hx_lda, u_x)
+    ex_val_pbe = trapz_integral(2 * np.pi * u_x * hx_pbe, u_x)
+    print("SUMrule ldax:", sumx_lda)
+    print("SUMrule ggax:", sumx_pbe)
+    print("Ex lda:", ex_val_lda)
+    print("Ex pbe:", ex_val_pbe)
 #########################
     #u = np.linspace(0,axis[-1],npts)
     #print("size",len(hx_lda),len(hx_pbe))
 
     phi = 0.5 * ((1 + zeta)**(2/3) + (1 - zeta)**(2/3))
-    t = np.zeros_like(density_total)
-    t[active_total] = sqrt_gtt[active_total] / (2 * ks[active_total] * phi[active_total] * density_total[active_total])
+    t = safe_divide(sqrt_gtt, 2 * ks * phi * density_total, where=active_total)
     ####
     a1 = -0.1244
     a2 = 0.027032
@@ -317,15 +367,18 @@ def DFThxcmodel(path):
     epsilon = 0.10161
     #########
     d  = 0.305-0.136*zeta*zeta
-    p  = np.pi*kf*d/(4*phi**4)
+    p  = safe_divide(np.pi * kf * d, 4 * phi**4)
     
     def f(z):
         f = ((1+z)**(4/3)+(1-z)**(4/3)-2)/(2**(4/3)-2)
         return f
     
     def G(rs_tmp,A,alpha1,beta1,beta2,beta3,beta4,P):
-        G = -2*A*(1+alpha1*rs_tmp)*np.log(1+1/(2*A*(beta1*rs_tmp**(1/2)+beta2*rs_tmp+beta3*rs_tmp**(3/2)+beta4*rs_tmp**(P+1))))
-        return G
+        denom = 2 * A * (
+            beta1 * rs_tmp**(1/2) + beta2 * rs_tmp + beta3 * rs_tmp**(3/2) + beta4 * rs_tmp**(P + 1)
+        )
+        log_term = 1 + safe_divide(1.0, denom)
+        return finite_or_zero(-2 * A * (1 + alpha1 * rs_tmp) * np.log(log_term))
 
     def scaled_exp1(x):
         x = np.asarray(x, dtype=float)
@@ -351,56 +404,63 @@ def DFThxcmodel(path):
     ec_1 = G(rs, 0.015545, 0.20548, 14.1189, 6.1977, 3.3662, 0.62517, 1)
     alpha_c = -G(rs, 0.016887, 0.11125, 10.357, 3.6231, 0.88026, 0.49671, 1)
     
-    ec = ec_0 + alpha_c*f(zeta)/1.709921*(1-zeta**4) + (ec_1 - ec_0)*f(zeta)*zeta**4
+    ec = finite_or_zero(ec_0 + alpha_c*f(zeta)/1.709921*(1-zeta**4) + (ec_1 - ec_0)*f(zeta)*zeta**4)
     
     c1 = -0.0012529\
             + 0.1244*p\
             + 0.61386*(1-zeta**2)/(phi**5*rs**2)*((1+alpha*rs)/(1+beta*rs+alpha*beta*rs**2)-1)
+    c1 = finite_or_zero(c1)
     c2 = 0.0033894-0.054388*p\
             + 0.39270*(1-zeta**2)/(phi**6*rs**1.5)*((1+gamma*rs)/(2+delta*rs+epsilon*rs**2))*((1+alpha*rs)/(1+beta*rs+alpha*beta*rs**2))
+    c2 = finite_or_zero(c2)
     c3 = 0.10847*p**2.5\
             + 1.4604*p**2\
             + 0.51749*p**1.5\
             - 3.5297*c1*p\
             - 1.9030*c2*p**0.5\
-            + 1.0685*p**2*np.log(p)\
+            + 1.0685*p**2*np.log(np.maximum(p, RHO_FLOOR))\
             + 34.356*phi**(-3)*ec*p**2
+    c3 = finite_or_zero(c3)
     c4 = -0.081596*p**3\
             -1.0810*p**2.5\
             -0.31677*p**2\
             +1.9030*c1*p**1.5\
             +0.76485*c2*p\
-            -0.71019*p**2.5*np.log(p)\
+            -0.71019*p**2.5*np.log(np.maximum(p, RHO_FLOOR))\
             -22.836*phi**(-3)*ec*p**2.5
+    c4 = finite_or_zero(c4)
 
     print("LDA C hole starts")
 
     v = np.outer(u, phi * ks)
     v_sq = v**2
-    radial_scale = np.outer(u, kf / phi)
-    exp_factor = np.exp(-d[np.newaxis, :] * radial_scale**2)
+    radial_scale = np.outer(u, safe_divide(kf, phi))
+    exp_factor = safe_negexp(d[np.newaxis, :] * radial_scale**2)
+    active_grid = active_total[np.newaxis, :]
 
-    f1 = (a1 + a2*v + a3*v_sq) / (1 + b1*v + b2*v_sq + b3*v**3 + b4*v**4)
+    f1 = safe_divide(a1 + a2*v + a3*v_sq, 1 + b1*v + b2*v_sq + b3*v**3 + b4*v**4, where=active_grid)
     f2 = (
         -a1 - (a2-a1*b1)*v + c1*v_sq + c2*v**3 + c3*v**4 + c4*v**5
     ) * exp_factor
-    Ac = (f1 + f2) / (4 * np.pi * v_sq)
+    Ac = safe_divide(f1 + f2, 4 * np.pi * v_sq, where=active_grid)
+    Ac[:, ~active_total] = 0.0
 
     phi_ks_factor = (phi**5 * ks**2)[np.newaxis, :]
-    nc_lsd = phi_ks_factor * Ac
-    hc_lda = ((nc_lsd * density_total[np.newaxis, :]) @ w) / Ntot
+    nc_lsd = finite_or_zero(phi_ks_factor * Ac)
+    hc_lda = finite_or_zero(((nc_lsd * density_total[np.newaxis, :]) @ w) / normalizer)
 
     beta_rs = 2 * p**2 / (3 * np.pi**3) * (1 - scaled_exp1(12 * p))
-    BcLM = (18*np.pi**3*(1+v_sq/12)**2)**(-1)
-    decay = np.exp(-p[np.newaxis, :] * v_sq)
-    Bc = BcLM * (1 - decay) + beta_rs[np.newaxis, :] * v_sq * decay
+    BcLM = safe_divide(1.0, 18*np.pi**3*(1+v_sq/12)**2, where=active_grid)
+    decay = safe_negexp(p[np.newaxis, :] * v_sq)
+    Bc = finite_or_zero(BcLM * (1 - decay) + beta_rs[np.newaxis, :] * v_sq * decay)
+    Bc[:, ~active_total] = 0.0
 
-    gga_hole = Ac + (t**2)[np.newaxis, :] * Bc
-    nc_gea = phi_ks_factor * gga_hole
+    gga_hole = finite_or_zero(Ac + (t**2)[np.newaxis, :] * Bc)
+    nc_gea = finite_or_zero(phi_ks_factor * gga_hole)
 
     # Keep the last sign change in the cumulative integral for each grid column.
-    Fint = CUMTRAPZ(v_sq * gga_hole, v, axis=0, initial=0)
-    sign_change = Fint[1:] * Fint[:-1] < 0
+    Fint = finite_or_zero(CUMTRAPZ(finite_or_zero(v_sq * gga_hole), v, axis=0, initial=0))
+    sign_change = np.isfinite(Fint[1:]) & np.isfinite(Fint[:-1]) & (Fint[1:] * Fint[:-1] < 0)
     candidate_rows = np.arange(1, npts)[:, np.newaxis]
     last_crossing = np.max(np.where(sign_change, candidate_rows, 0), axis=0)
     vc = np.zeros_like(phi)
@@ -413,7 +473,14 @@ def DFThxcmodel(path):
         f0 = Fint[idx_left, crossing_cols]
         f1 = Fint[idx_right, crossing_cols]
         denom = f1 - f0
-        vc[crossing_cols] = np.where(np.abs(denom) > 0, v0 - f0 * (v1 - v0) / denom, v1)
+        good_bracket = np.isfinite(v0) & np.isfinite(v1) & np.isfinite(f0) & np.isfinite(f1)
+        correction = safe_divide(f0 * (v1 - v0), denom, where=good_bracket)
+        interpolated = np.where(
+            good_bracket & (np.abs(denom) > DENOM_FLOOR),
+            v0 - correction,
+            v1,
+        )
+        vc[crossing_cols] = finite_or_zero(interpolated)
 
     nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
     nc_gga[:, ~active_total] = 0.0
@@ -421,21 +488,21 @@ def DFThxcmodel(path):
     print(" ")
     print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe))
     print(" ")
-    hc_pbe = ((nc_gga * density_total[np.newaxis, :]) @ w) / Ntot
+    hc_pbe = finite_or_zero(((nc_gga * density_total[np.newaxis, :]) @ w) / normalizer)
 
     print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe))
-    hxc_lda= hx_lda + hc_lda
+    hxc_lda = finite_or_zero(hx_lda + hc_lda)
+    hxc_pbe = finite_or_zero(hx_pbe + hc_pbe)
 
-    hxc_pbe= hx_pbe + hc_pbe
 
-
-    cx_lda  = (hx_lda[1]  - hx_lda[0])  / (u[1]-u[0])
-    cc_lda  = (hc_lda[1]  - hc_lda[0])  / (u[1]-u[0])
-    cxc_lda = (hxc_lda[1] - hxc_lda[0]) / (u[1]-u[0])
+    du0 = u[1] - u[0]
+    cx_lda  = float(safe_divide(hx_lda[1]  - hx_lda[0],  du0))
+    cc_lda  = float(safe_divide(hc_lda[1]  - hc_lda[0],  du0))
+    cxc_lda = float(safe_divide(hxc_lda[1] - hxc_lda[0], du0))
     
-    cx_pbe  = (hx_pbe[1]  - hx_pbe[0])  / (u[1]-u[0])
-    cc_pbe  = (hc_pbe[1]  - hc_pbe[0])  / (u[1]-u[0])
-    cxc_pbe = (hxc_pbe[1] - hxc_pbe[0]) / (u[1]-u[0])
+    cx_pbe  = float(safe_divide(hx_pbe[1]  - hx_pbe[0],  du0))
+    cc_pbe  = float(safe_divide(hc_pbe[1]  - hc_pbe[0],  du0))
+    cxc_pbe = float(safe_divide(hxc_pbe[1] - hxc_pbe[0], du0))
     
 
     print("hc_pbe",hc_pbe)
@@ -443,10 +510,12 @@ def DFThxcmodel(path):
     print("dens_b",np.dot(nb,w))
     print("dens_+",np.dot(na+nb,w))
 
-    print("sumrule ldax", np.sum(4*np.pi*u**2*hx_lda) * delta_u)
-    print("sumrule ggax", np.sum(4*np.pi*u**2*hx_pbe) * delta_u)
-    print("sumrule ldac", np.sum(4*np.pi*u**2*hc_lda) * delta_u)
-    print("sumrule ggac", np.sum(4*np.pi*u**2*hc_pbe) * delta_u)
+    sumc_lda = trapz_integral(4 * np.pi * u**2 * hc_lda, u)
+    sumc_pbe = trapz_integral(4 * np.pi * u**2 * hc_pbe, u)
+    print("sumrule ldax", sumx_lda)
+    print("sumrule ggax", sumx_pbe)
+    print("sumrule ldac", sumc_lda)
+    print("sumrule ggac", sumc_pbe)
     
     
         # Get the filename from the path
@@ -464,13 +533,13 @@ def DFThxcmodel(path):
     ofile = open(f'XChole_energy_{after}.txt','w')
 
 
-    ex_lda  = CUMTRAPZ(4 * np.pi * hx_lda * u, u, initial=0)
-    ec_lda  = CUMTRAPZ(4 * np.pi * hc_lda * u, u, initial=0)
-    exc_lda = CUMTRAPZ(4 * np.pi * (hx_lda + hc_lda) * u, u, initial=0)
+    ex_lda  = cumulative_integral(4 * np.pi * hx_lda * u, u)
+    ec_lda  = cumulative_integral(4 * np.pi * hc_lda * u, u)
+    exc_lda = cumulative_integral(4 * np.pi * (hx_lda + hc_lda) * u, u)
 
-    ex_pbe  = CUMTRAPZ(4 * np.pi * hx_pbe * u, u, initial=0)
-    ec_pbe  = CUMTRAPZ(4 * np.pi * hc_pbe * u, u, initial=0)
-    exc_pbe = CUMTRAPZ(4 * np.pi * (hx_pbe + hc_pbe) * u, u, initial=0)
+    ex_pbe  = cumulative_integral(4 * np.pi * hx_pbe * u, u)
+    ec_pbe  = cumulative_integral(4 * np.pi * hc_pbe * u, u)
+    exc_pbe = cumulative_integral(4 * np.pi * (hx_pbe + hc_pbe) * u, u)
     
     print("E_LDA", ex_lda[-1], ec_lda[-1], exc_lda[-1])
     print("E_PBE", ex_pbe[-1], ec_pbe[-1], exc_pbe[-1])
@@ -485,11 +554,11 @@ def DFThxcmodel(path):
     ofile.write('PBE:Ec  = {0: 16.12f}  \n'.format(ec_pbe[-1]))
     ofile.write('PBE:Exc = {0: 16.12f}  \n'.format(exc_pbe[-1]))
     ofile.write('\n')
-    ofile.write('LDA:Sumx  = {0: 16.12f}  \n'.format(np.sum(4*np.pi*u**2*hx_lda) * delta_u))
-    ofile.write('LDA:Sumc  = {0: 16.12f}  \n'.format(np.sum(4*np.pi*u**2*hc_lda) * delta_u))
+    ofile.write('LDA:Sumx  = {0: 16.12f}  \n'.format(sumx_lda))
+    ofile.write('LDA:Sumc  = {0: 16.12f}  \n'.format(sumc_lda))
     ofile.write('\n')
-    ofile.write('PBE:Sumx  = {0: 16.12f}  \n'.format(np.sum(4*np.pi*u**2*hx_pbe) * delta_u))
-    ofile.write('PBE:Sumc  = {0: 16.12f}  \n'.format(np.sum(4*np.pi*u**2*hc_pbe) * delta_u))
+    ofile.write('PBE:Sumx  = {0: 16.12f}  \n'.format(sumx_pbe))
+    ofile.write('PBE:Sumc  = {0: 16.12f}  \n'.format(sumc_pbe))
     ofile.write('\n')      
     ofile.write('ontop x  = {0: 16.12f}  \n'.format(hx_lda[0]))
     ofile.write('ontop c  = {0: 16.12f}  \n'.format(hc_lda[0]))
