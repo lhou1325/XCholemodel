@@ -41,6 +41,16 @@ EXPECTED_PATHOLOGICAL_SCALARS = {
     "PBE:Sumx": -0.995690140678,
     "PBE:Sumc": 0.0,
 }
+EXPECTED_PROGRESS_STEPS = (
+    "[1/8] Load input grid data...",
+    "[2/8] Build radial grid...",
+    "[3/8] Derive density fields...",
+    "[4/8] Compute exchange holes...",
+    "[5/8] Compute correlation holes...",
+    "[6/8] Summarize energies and sum rules...",
+    "[7/8] Write text report...",
+    "[8/8] Write plot file...",
+)
 
 
 def load_holemodel_module(store):
@@ -161,10 +171,11 @@ def run_model(module, store, fixture_name, datasets):
         input_path = os.path.abspath(os.path.join(tmpdir, f"{fixture_name}.plot"))
         store[input_path] = datasets
 
+        captured_stdout = io.StringIO()
         cwd = os.getcwd()
         try:
             os.chdir(tmpdir)
-            with contextlib.redirect_stdout(io.StringIO()):
+            with contextlib.redirect_stdout(captured_stdout):
                 module.DFThxcmodel(input_path)
         finally:
             os.chdir(cwd)
@@ -172,9 +183,10 @@ def run_model(module, store, fixture_name, datasets):
         text_path = Path(tmpdir) / f"XChole_energy_{fixture_name}.txt"
         text_metrics = parse_text_report(text_path)
         text_body = text_path.read_text()
+        console_output = captured_stdout.getvalue()
         plot_output = get_store_entry(store, f"XCholemodel_{fixture_name}.plot")
         copied_plot_output = {name: np.array(values, copy=True) for name, values in plot_output.items()}
-    return text_metrics, text_body, copied_plot_output
+    return text_metrics, text_body, copied_plot_output, console_output
 
 
 class HoleModelRobustnessTests(unittest.TestCase):
@@ -191,6 +203,28 @@ class HoleModelRobustnessTests(unittest.TestCase):
         self.assertEqual(tuple(plot_output.keys()), EXPECTED_PLOT_DATASET_NAMES)
         for dataset_name, values in plot_output.items():
             self.assertTrue(np.isfinite(values).all(), msg=dataset_name)
+
+    def assert_progress_output(self, console_output):
+        self.assertIn("XCholemodel progress", console_output)
+        self.assertIn("Input file:", console_output)
+        self.assertIn("Planned steps: 8", console_output)
+        self.assertIn("Final summary", console_output)
+        self.assertIn("Total runtime:", console_output)
+        self.assertEqual(console_output.count("Done in "), 8)
+        self.assertIn("Preparing exchange kernels and spin-scaled radii.", console_output)
+        self.assertIn("Contracting weighted exchange profiles over the grid.", console_output)
+        self.assertIn("Evaluating PW92/LDA correlation ingredients.", console_output)
+        self.assertIn("Building the GGA correction and radial cutoff.", console_output)
+        self.assertIn("Contracting correlation profiles over the grid.", console_output)
+        self.assertNotIn("array(", console_output)
+        self.assertNotIn("hx_lda finish", console_output)
+
+        last_position = -1
+        for step_line in EXPECTED_PROGRESS_STEPS:
+            position = console_output.find(step_line)
+            self.assertNotEqual(position, -1, msg=step_line)
+            self.assertGreater(position, last_position, msg=step_line)
+            last_position = position
 
     def test_safe_helpers_return_finite_values(self):
         module = load_holemodel_module({})
@@ -237,15 +271,47 @@ class HoleModelRobustnessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "grd dataset"):
                 module._load_grid_data(bad_grd_path)
 
+    def test_failure_path_reports_the_active_step(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = {}
+            module = load_holemodel_module(store)
+            bad_path = os.path.abspath(os.path.join(tmpdir, "broken.plot"))
+            store[bad_path] = {
+                "rho": np.zeros((3, 2), dtype=float),
+                "grd": np.zeros((3, 7), dtype=float),
+                "xyz": np.zeros((2, 4), dtype=float),
+            }
+
+            captured_stdout = io.StringIO()
+            cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                with contextlib.redirect_stdout(captured_stdout):
+                    with self.assertRaisesRegex(ValueError, "rho and xyz"):
+                        module.DFThxcmodel(bad_path)
+            finally:
+                os.chdir(cwd)
+
+            console_output = captured_stdout.getvalue()
+            self.assertIn("[1/8] Load input grid data...", console_output)
+            self.assertIn("FAILED after ", console_output)
+            self.assertIn("during Load input grid data", console_output)
+
     def test_pathological_fixture_preserves_scalar_outputs(self):
         store = {}
         module = load_holemodel_module(store)
-        text_metrics, text_body, plot_output = run_model(module, store, "pathological", pathological_input())
+        text_metrics, text_body, plot_output, console_output = run_model(
+            module,
+            store,
+            "pathological",
+            pathological_input(),
+        )
 
         self.assertNotIn("nan", text_body.lower())
         self.assertNotIn("inf", text_body.lower())
         self.assert_metrics_close(text_metrics, EXPECTED_PATHOLOGICAL_SCALARS)
         self.assert_valid_plot_output(plot_output)
+        self.assert_progress_output(console_output)
 
     def test_output_schema_and_finiteness_for_fixture_outputs(self):
         fixtures = {
@@ -257,12 +323,18 @@ class HoleModelRobustnessTests(unittest.TestCase):
             with self.subTest(fixture=fixture_name):
                 store = {}
                 module = load_holemodel_module(store)
-                text_metrics, text_body, plot_output = run_model(module, store, fixture_name, factory())
+                text_metrics, text_body, plot_output, console_output = run_model(
+                    module,
+                    store,
+                    fixture_name,
+                    factory(),
+                )
 
                 self.assertTrue(all(np.isfinite(value) for value in text_metrics.values()))
                 self.assertNotIn("nan", text_body.lower())
                 self.assertNotIn("inf", text_body.lower())
                 self.assert_valid_plot_output(plot_output)
+                self.assertIn("Final summary", console_output)
 
 
 if __name__ == "__main__":

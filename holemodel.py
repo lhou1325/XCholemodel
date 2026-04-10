@@ -13,6 +13,7 @@ from dataclasses import dataclass
 import math
 import os
 import sys
+import time
 
 import h5py
 import numpy as np
@@ -75,6 +76,17 @@ PLOT_DATASET_ORDER = (
     "PBE_EX",
     "PBE_EC",
     "PBE_EXC",
+)
+
+RUN_STEP_DEFINITIONS = (
+    ("Load input grid data", "Reading densities, gradients, and integration weights from the HDF5 file."),
+    ("Build radial grid", "Constructing the u-axis used for hole profiles and cumulative energies."),
+    ("Derive density fields", "Preparing reduced gradients and spin-polarization quantities."),
+    ("Compute exchange holes", "Building the LDA and PBE exchange-hole profiles."),
+    ("Compute correlation holes", "Building the LDA and PBE correlation-hole profiles."),
+    ("Summarize energies and sum rules", "Combining hole profiles into energies, sum rules, and cusp values."),
+    ("Write text report", "Saving the human-readable energy summary file."),
+    ("Write plot file", "Saving the HDF5 plot datasets for downstream analysis."),
 )
 
 
@@ -151,6 +163,17 @@ class ModelReport:
     cusp_x: float
     cusp_c: float
     cusp_xc: float
+
+
+@dataclass
+class RunStatus:
+    input_path: str
+    output_stem: str
+    total_steps: int
+    run_start: float
+    current_step_number: int = 0
+    current_step_name: str = ""
+    current_step_start: float = 0.0
 
 
 def safe_clip_density(rho):
@@ -237,6 +260,99 @@ def scaled_exp1(x):
     return finite_or_zero(out)
 
 
+def _format_seconds(seconds):
+    return f"{seconds:.2f} s"
+
+
+def _make_run_status(path):
+    input_path = os.path.abspath(path)
+    return RunStatus(
+        input_path=input_path,
+        output_stem=_output_stem(input_path),
+        total_steps=len(RUN_STEP_DEFINITIONS),
+        run_start=time.monotonic(),
+    )
+
+
+def _log_run_header(status):
+    print("XCholemodel progress")
+    print(f"Input file: {status.input_path}")
+    print(f"Planned steps: {status.total_steps}")
+
+
+def _start_step(status, step_name, detail):
+    status.current_step_number += 1
+    status.current_step_name = step_name
+    status.current_step_start = time.monotonic()
+    print("")
+    print(f"[{status.current_step_number}/{status.total_steps}] {step_name}...")
+    print(f"    {detail}")
+
+
+def _log_substep(_, message):
+    print(f"    - {message}")
+
+
+def _finish_step(status, detail=None):
+    elapsed = time.monotonic() - status.current_step_start
+    message = f"    Done in {_format_seconds(elapsed)}"
+    if detail:
+        message += f" | {detail}"
+    print(message)
+
+
+def _fail_step(status, exc):
+    elapsed = time.monotonic() - status.current_step_start
+    print(f"    FAILED after {_format_seconds(elapsed)} during {status.current_step_name}: {exc}")
+
+
+def _render_step_detail(detail, result):
+    if detail is None:
+        return None
+    if callable(detail):
+        return detail(result)
+    return detail
+
+
+def _run_step(status, step_name, detail, func, *args, completion_detail=None):
+    _start_step(status, step_name, detail)
+    try:
+        result = func(*args)
+    except Exception as exc:
+        _fail_step(status, exc)
+        raise
+    _finish_step(status, _render_step_detail(completion_detail, result))
+    return result
+
+
+def _log_final_summary(status, report, text_report_path, plot_file_path):
+    total_runtime = time.monotonic() - status.run_start
+    print("")
+    print("Final summary")
+    print(
+        "  LDA: "
+        f"Ex={report.ex_lda[-1]: .12f}  "
+        f"Ec={report.ec_lda[-1]: .12f}  "
+        f"Exc={report.exc_lda[-1]: .12f}"
+    )
+    print(
+        "  PBE: "
+        f"Ex={report.ex_pbe[-1]: .12f}  "
+        f"Ec={report.ec_pbe[-1]: .12f}  "
+        f"Exc={report.exc_pbe[-1]: .12f}"
+    )
+    print(
+        "  Sum rules: "
+        f"LDA Sumx={report.sumx_lda: .12f}, "
+        f"LDA Sumc={report.sumc_lda: .12f}, "
+        f"PBE Sumx={report.sumx_pbe: .12f}, "
+        f"PBE Sumc={report.sumc_pbe: .12f}"
+    )
+    print(f"  Text report: {text_report_path}")
+    print(f"  Plot file: {plot_file_path}")
+    print(f"  Total runtime: {_format_seconds(total_runtime)}")
+
+
 def _load_grid_data(path):
     density_file = h5py.File(path, "r")
     try:
@@ -287,26 +403,6 @@ def _build_radial_grid():
         exchange_u=exchange_u,
         u_axis=u_axis,
     )
-
-
-def _log_run_header(grid, radial):
-    print("Start XCholemodel")
-    print(f"Input file: {grid.path}")
-    print("N_up:", grid.electron_count_up)
-    print("N_down:", grid.electron_count_down)
-    print("N_tot:", grid.electron_count_total)
-    print("npts points:", radial.npts)
-    print("u range: 0~", radial.energy_u[-1])
-
-
-def _log_summary(report):
-    print("SUMrule ldax:", report.sumx_lda)
-    print("SUMrule ggax:", report.sumx_pbe)
-    print("SUMrule ldac:", report.sumc_lda)
-    print("SUMrule ggac:", report.sumc_pbe)
-    print("E_LDA", report.ex_lda[-1], report.ec_lda[-1], report.exc_lda[-1])
-    print("E_PBE", report.ex_pbe[-1], report.ec_pbe[-1], report.exc_pbe[-1])
-
 
 def _derive_fields(grid, radial):
     grad_up_sq = np.einsum("ij,ij->i", grid.grad_up, grid.grad_up)
@@ -475,7 +571,9 @@ def _j_gga_kernel(s, x):
     return finite_or_zero(output)
 
 
-def _compute_exchange_holes(grid, radial, fields):
+def _compute_exchange_holes(grid, radial, fields, status=None):
+    if status is not None:
+        _log_substep(status, "Preparing exchange kernels and spin-scaled radii.")
     spin_scale_up = (1 + fields.zeta) ** (1 / 3) * fields.kf
     spin_scale_down = (1 - fields.zeta) ** (1 / 3) * fields.kf
     x_up = np.outer(radial.exchange_u, spin_scale_up)
@@ -483,6 +581,8 @@ def _compute_exchange_holes(grid, radial, fields):
     spin_density_up = (2 * grid.rho_up) ** 2
     spin_density_down = (2 * grid.rho_down) ** 2
 
+    if status is not None:
+        _log_substep(status, "Contracting weighted exchange profiles over the grid.")
     hx_lda = finite_or_zero(
         (
             (_j_lda_kernel(x_up) * spin_density_up + _j_lda_kernel(x_down) * spin_density_down)
@@ -630,7 +730,9 @@ def _interpolate_cutoff(v, cumulative_values):
     return vc
 
 
-def _compute_correlation_holes(grid, radial, fields):
+def _compute_correlation_holes(grid, radial, fields, status=None):
+    if status is not None:
+        _log_substep(status, "Evaluating PW92/LDA correlation ingredients.")
     ec_0 = pw92_correlation_energy(fields.rs, *PW92_UNPOLARIZED)
     ec_1 = pw92_correlation_energy(fields.rs, *PW92_FULLY_POLARIZED)
     alpha_c = -pw92_correlation_energy(fields.rs, *PW92_ALPHA_C)
@@ -659,6 +761,8 @@ def _compute_correlation_holes(grid, radial, fields):
     nc_lsd = finite_or_zero(phi_ks_factor * lda_correlation_kernel)
     hc_lda = finite_or_zero(((nc_lsd * grid.density_total[np.newaxis, :]) @ grid.grid_weights) / grid.normalizer)
 
+    if status is not None:
+        _log_substep(status, "Building the GGA correction and radial cutoff.")
     gga_correction_kernel = _gga_correction_kernel(v_sq, fields, active_grid)
     gga_hole = finite_or_zero(lda_correlation_kernel + (fields.t**2)[np.newaxis, :] * gga_correction_kernel)
     nc_gea = finite_or_zero(phi_ks_factor * gga_hole)
@@ -668,6 +772,8 @@ def _compute_correlation_holes(grid, radial, fields):
 
     nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
     nc_gga[:, ~fields.active_total] = 0.0
+    if status is not None:
+        _log_substep(status, "Contracting correlation profiles over the grid.")
     hc_pbe = finite_or_zero(((nc_gga * grid.density_total[np.newaxis, :]) @ grid.grid_weights) / grid.normalizer)
     return hc_lda, hc_pbe
 
@@ -748,8 +854,10 @@ def _write_text_report(output_stem, report):
         f"cusp c  = {report.cusp_c: 16.12f}  ",
         f"cusp xc = {report.cusp_xc: 16.12f}  ",
     ]
-    with open(f"XChole_energy_{output_stem}.txt", "w", encoding="utf-8") as report_file:
+    report_path = os.path.abspath(f"XChole_energy_{output_stem}.txt")
+    with open(report_path, "w", encoding="utf-8") as report_file:
         report_file.write("\n".join(report_lines) + "\n")
+    return report_path
 
 
 def _write_plot_file(output_stem, radial, report):
@@ -769,7 +877,8 @@ def _write_plot_file(output_stem, radial, report):
         "PBE_EXC": report.exc_pbe,
     }
 
-    plot_file = h5py.File(f"XCholemodel_{output_stem}.plot", "w")
+    plot_path = os.path.abspath(f"XCholemodel_{output_stem}.plot")
+    plot_file = h5py.File(plot_path, "w")
     try:
         for dataset_name in PLOT_DATASET_ORDER:
             values = np.asarray(dataset_values[dataset_name], dtype=float)
@@ -777,22 +886,90 @@ def _write_plot_file(output_stem, radial, report):
             plot_file[dataset_name][:] = values
     finally:
         plot_file.close()
+    return plot_path
 
 
 def DFThxcmodel(path):
-    grid = _load_grid_data(path)
-    radial = _build_radial_grid()
-    _log_run_header(grid, radial)
+    status = _make_run_status(path)
+    _log_run_header(status)
 
-    fields = _derive_fields(grid, radial)
-    hx_lda, hx_pbe = _compute_exchange_holes(grid, radial, fields)
-    hc_lda, hc_pbe = _compute_correlation_holes(grid, radial, fields)
-    report = _summarize_results(radial, hx_lda, hx_pbe, hc_lda, hc_pbe)
-
-    _log_summary(report)
-    output_stem = _output_stem(path)
-    _write_text_report(output_stem, report)
-    _write_plot_file(output_stem, radial, report)
+    grid = _run_step(
+        status,
+        *RUN_STEP_DEFINITIONS[0],
+        _load_grid_data,
+        path,
+        completion_detail=lambda loaded_grid: (
+            f"{loaded_grid.density_total.size} grid points | "
+            f"N_up={loaded_grid.electron_count_up:.6f} | "
+            f"N_down={loaded_grid.electron_count_down:.6f} | "
+            f"N_tot={loaded_grid.electron_count_total:.6f}"
+        ),
+    )
+    radial = _run_step(
+        status,
+        *RUN_STEP_DEFINITIONS[1],
+        _build_radial_grid,
+        completion_detail=lambda built_radial: (
+            f"{built_radial.npts} radial points | u_max={built_radial.energy_u[-1]:.4f}"
+        ),
+    )
+    fields = _run_step(
+        status,
+        *RUN_STEP_DEFINITIONS[2],
+        _derive_fields,
+        grid,
+        radial,
+        completion_detail="Prepared reduced gradients and spin-polarization quantities.",
+    )
+    hx_lda, hx_pbe = _run_step(
+        status,
+        *RUN_STEP_DEFINITIONS[3],
+        _compute_exchange_holes,
+        grid,
+        radial,
+        fields,
+        status,
+        completion_detail="Generated LDA and PBE exchange-hole profiles.",
+    )
+    hc_lda, hc_pbe = _run_step(
+        status,
+        *RUN_STEP_DEFINITIONS[4],
+        _compute_correlation_holes,
+        grid,
+        radial,
+        fields,
+        status,
+        completion_detail="Generated LDA and PBE correlation-hole profiles.",
+    )
+    report = _run_step(
+        status,
+        *RUN_STEP_DEFINITIONS[5],
+        _summarize_results,
+        radial,
+        hx_lda,
+        hx_pbe,
+        hc_lda,
+        hc_pbe,
+        completion_detail="Computed energies, sum rules, and cusp values.",
+    )
+    text_report_path = _run_step(
+        status,
+        *RUN_STEP_DEFINITIONS[6],
+        _write_text_report,
+        status.output_stem,
+        report,
+        completion_detail=lambda report_path: f"Saved {report_path}",
+    )
+    plot_file_path = _run_step(
+        status,
+        *RUN_STEP_DEFINITIONS[7],
+        _write_plot_file,
+        status.output_stem,
+        radial,
+        report,
+        completion_detail=lambda plot_path: f"Saved {plot_path}",
+    )
+    _log_final_summary(status, report, text_report_path, plot_file_path)
 
 
 def main():
