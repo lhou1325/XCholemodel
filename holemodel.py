@@ -9,7 +9,7 @@ from scipy.interpolate import InterpolatedUnivariateSpline
 import numpy as np
 import math
 import time
-from scipy.special import erf, exp1
+from scipy.special import erf, exp1, erfcx
 from scipy import integrate
 from tqdm import trange
 
@@ -18,6 +18,26 @@ CUMTRAPZ = (
     if hasattr(integrate, "cumulative_trapezoid")
     else integrate.cumtrapz
 )
+
+RHO_FLOOR = 1e-18
+PBE_S_REGULARIZATION_START = 8.0
+PBE_S_REGULARIZATION_LIMIT = 11.0
+
+
+def safe_clip_density(rho):
+    return np.clip(rho, 0.0, None)
+
+
+def regularize_reduced_gradient(s, s1=PBE_S_REGULARIZATION_START, s2=PBE_S_REGULARIZATION_LIMIT):
+    """Regularize large reduced gradients to avoid the known PBE hole pathologies."""
+    s = np.asarray(s, dtype=float)
+    out = np.clip(s, 0.0, None).copy()
+    mask = out > s1
+    if np.any(mask):
+        delta = out[mask] - s1
+        out[mask] = out[mask] - delta * np.exp(-(s2 - s1) / delta)
+        out[mask] = np.minimum(out[mask], np.nextafter(s2, 0.0))
+    return out
 
 
 def print_progress(iteration, total, offset=0):
@@ -48,8 +68,8 @@ def DFThxcmodel(path):
     
     f = h5py.File(path, 'r')
     
-    na = f['rho'][:,0]
-    nb = f['rho'][:,1]
+    na = safe_clip_density(f['rho'][:,0])
+    nb = safe_clip_density(f['rho'][:,1])
     
     ga = f['grd'][:,0:3]
     gb = f['grd'][:,4:7]
@@ -117,11 +137,32 @@ def DFThxcmodel(path):
     u = u_x.copy()
     u[0] = 1e-10
 
-    kf = (3*math.pi**2*density_total)**(1/3)
+    active_total = density_total > RHO_FLOOR
+    active_up = na > RHO_FLOOR
+    active_down = nb > RHO_FLOOR
+
+    density_safe = np.where(active_total, density_total, RHO_FLOOR)
+    na_safe = np.where(active_up, na, RHO_FLOOR)
+    nb_safe = np.where(active_down, nb, RHO_FLOOR)
+
+    sqrt_gtt = np.sqrt(np.clip(gtt, 0.0, None))
+    sqrt_gaa = np.sqrt(np.clip(gaa, 0.0, None))
+    sqrt_gbb = np.sqrt(np.clip(gbb, 0.0, None))
+
+    kf = (3 * math.pi**2 * density_safe)**(1/3)
     #r = np.linspace(0,5,101)
-    s = np.sqrt(gtt)/(2*kf*density_total)
-    s_2a = 2*np.sqrt(gaa)/(2*(3*math.pi**2*(na*2))**(1/3)*(na*2))
-    s_2b = 2*np.sqrt(gbb)/(2*(3*math.pi**2*(nb*2))**(1/3)*(nb*2))
+    s = np.zeros_like(density_total)
+    s[active_total] = sqrt_gtt[active_total] / (2 * kf[active_total] * density_total[active_total])
+    s = regularize_reduced_gradient(s)
+
+    spin_kf_up = (3 * math.pi**2 * (2 * na_safe))**(1/3)
+    spin_kf_down = (3 * math.pi**2 * (2 * nb_safe))**(1/3)
+    s_2a = np.zeros_like(na)
+    s_2b = np.zeros_like(nb)
+    s_2a[active_up] = sqrt_gaa[active_up] / (spin_kf_up[active_up] * (2 * na[active_up]))
+    s_2b[active_down] = sqrt_gbb[active_down] / (spin_kf_down[active_down] * (2 * nb[active_down]))
+    s_2a = regularize_reduced_gradient(s_2a)
+    s_2b = regularize_reduced_gradient(s_2b)
     
     #constant for GGA
     a1 = 0.00979681
@@ -142,9 +183,11 @@ def DFThxcmodel(path):
     hc_lda = np.zeros(npts)
     hc_pbe = np.zeros(npts)
     
-    rs   = (3/(4*np.pi*density_total))**(1/3)
-    zeta = (na-nb)/density_total
-    ks   = (4*kf/np.pi)**(0.5)
+    rs = (3 / (4 * np.pi * density_safe))**(1/3)
+    zeta = np.zeros_like(density_total)
+    zeta[active_total] = (na[active_total] - nb[active_total]) / density_total[active_total]
+    zeta = np.clip(zeta, -1.0, 1.0)
+    ks = np.sqrt(4 * kf / np.pi)
 
     def reduced_density_gradient(gradn, kf, n):
         numerator = abs(gradn)
@@ -161,17 +204,20 @@ def DFThxcmodel(path):
         return h_out
     
     def F_function(h):
-        f_out = 6.475*H_gga+0.4797
+        f_out = 6.475 * h + 0.4797
         return f_out
     
     def constant_a(a,b,c,d,e,h,f,s):
-        first_term = 15*e+(6*c*(1+f*s**2)*(d+h*s**2))
-        second_term = 4*b*((d+h*s**2)**2)+8*a*((d+h*s**2)**3)
+        h = np.clip(h, 0.0, None)
+        denom_term = d + h * s**2
+        first_term = 15*e+(6*c*(1+f*s**2)*denom_term)
+        second_term = 4*b*(denom_term**2)+8*a*(denom_term**3)
         first_value = np.sqrt(math.pi)*(first_term+second_term)
-        third_term = 1/(16*(d+h*s**2)**(7/2))
-        fourth_term = (3*math.pi*np.sqrt(a)/4)*(np.exp(9*h*s**2/(4*a)))*(1-erf((3*s/2)*np.sqrt(h/a)))
-    
-        a_out = (first_value*third_term)-fourth_term
+        third_term = 1/(16*denom_term**(7/2))
+        erfcx_arg = (3 * s / 2) * np.sqrt(h / a)
+        fourth_term = (3 * math.pi * np.sqrt(a) / 4) * erfcx(erfcx_arg)
+
+        a_out = (first_value * third_term) - fourth_term
         return a_out
     
     def constant_b(s,d,h):
@@ -181,9 +227,10 @@ def DFThxcmodel(path):
         return b_out
     
     def G_function(v1,v2,e):
-        numerator = 0.75*math.pi+v1
-        denominator = v2*e
-        out = -(numerator/denominator)
+        numerator = 0.75 * math.pi + v1
+        denominator = v2 * e
+        out = np.zeros_like(numerator, dtype=float)
+        np.divide(-numerator, denominator, out=out, where=np.abs(denominator) > 0)
         return out
     
     def J_gga(s,x):
@@ -251,8 +298,9 @@ def DFThxcmodel(path):
     #u = np.linspace(0,axis[-1],npts)
     #print("size",len(hx_lda),len(hx_pbe))
 
-    phi  = 0.5*((1+zeta)**(2/3)+(1-zeta)**(2/3))
-    t    = np.sqrt(gtt)/(2*ks*phi*density_total)
+    phi = 0.5 * ((1 + zeta)**(2/3) + (1 - zeta)**(2/3))
+    t = np.zeros_like(density_total)
+    t[active_total] = sqrt_gtt[active_total] / (2 * ks[active_total] * phi[active_total] * density_total[active_total])
     ####
     a1 = -0.1244
     a2 = 0.027032
@@ -282,8 +330,12 @@ def DFThxcmodel(path):
     def scaled_exp1(x):
         x = np.asarray(x, dtype=float)
         out = np.empty_like(x)
+        zero = x <= 0
         large = x > 50
-        small = ~large
+        small = ~(zero | large)
+
+        if np.any(zero):
+            out[zero] = 0.0
 
         if np.any(small):
             x_small = x[small]
@@ -348,14 +400,23 @@ def DFThxcmodel(path):
 
     # Keep the last sign change in the cumulative integral for each grid column.
     Fint = CUMTRAPZ(v_sq * gga_hole, v, axis=0, initial=0)
-    sign_change = Fint[1:-2] * Fint[:-3] < 0
-    candidate_rows = np.arange(1, npts - 2)[:, np.newaxis]
+    sign_change = Fint[1:] * Fint[:-1] < 0
+    candidate_rows = np.arange(1, npts)[:, np.newaxis]
     last_crossing = np.max(np.where(sign_change, candidate_rows, 0), axis=0)
     vc = np.zeros_like(phi)
     crossing_cols = np.nonzero(last_crossing)[0]
-    vc[crossing_cols] = v[last_crossing[crossing_cols], crossing_cols]
+    if crossing_cols.size:
+        idx_right = last_crossing[crossing_cols]
+        idx_left = idx_right - 1
+        v0 = v[idx_left, crossing_cols]
+        v1 = v[idx_right, crossing_cols]
+        f0 = Fint[idx_left, crossing_cols]
+        f1 = Fint[idx_right, crossing_cols]
+        denom = f1 - f0
+        vc[crossing_cols] = np.where(np.abs(denom) > 0, v0 - f0 * (v1 - v0) / denom, v1)
 
-    nc_gga = np.where(v < vc[np.newaxis, :], nc_gea, 0.0)
+    nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
+    nc_gga[:, ~active_total] = 0.0
 
     print(" ")
     print("size",len(hx_lda),len(hc_lda),len(hx_pbe),len(hc_pbe))
