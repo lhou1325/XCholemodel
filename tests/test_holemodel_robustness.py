@@ -10,6 +10,8 @@ from pathlib import Path
 from unittest import mock
 
 import numpy as np
+import scipy.integrate  # noqa: F401
+import scipy.special  # noqa: F401
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -212,10 +214,10 @@ class HoleModelRobustnessTests(unittest.TestCase):
         self.assertIn("Total runtime:", console_output)
         self.assertEqual(console_output.count("Done in "), 8)
         self.assertIn("Preparing exchange kernels and spin-scaled radii.", console_output)
-        self.assertIn("Contracting weighted exchange profiles over the grid.", console_output)
+        self.assertIn("Contracting weighted exchange profiles over the grid", console_output)
         self.assertIn("Evaluating PW92/LDA correlation ingredients.", console_output)
-        self.assertIn("Building the GGA correction and radial cutoff.", console_output)
-        self.assertIn("Contracting correlation profiles over the grid.", console_output)
+        self.assertIn("Building the GGA correction and radial cutoff", console_output)
+        self.assertIn("Contracting correlation profiles over the grid", console_output)
         self.assertNotIn("array(", console_output)
         self.assertNotIn("hx_lda finish", console_output)
 
@@ -340,6 +342,23 @@ class HoleModelRobustnessTests(unittest.TestCase):
         self.assert_metrics_close(text_metrics, EXPECTED_PATHOLOGICAL_SCALARS)
         self.assert_valid_plot_output(plot_output)
         self.assert_progress_output(console_output)
+
+    def test_small_radial_chunks_preserve_scalar_outputs(self):
+        store = {}
+        module = load_holemodel_module(store)
+        with mock.patch.dict(os.environ, {"XCHOLEMODEL_RADIAL_CHUNK_SIZE": "7"}):
+            text_metrics, text_body, plot_output, console_output = run_model(
+                module,
+                store,
+                "pathological_chunked",
+                pathological_input(),
+            )
+
+        self.assertNotIn("nan", text_body.lower())
+        self.assertNotIn("inf", text_body.lower())
+        self.assert_metrics_close(text_metrics, EXPECTED_PATHOLOGICAL_SCALARS)
+        self.assert_valid_plot_output(plot_output)
+        self.assertIn("chunks of 7 radial points", console_output)
 
     def test_output_schema_and_finiteness_for_fixture_outputs(self):
         fixtures = {

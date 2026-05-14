@@ -41,6 +41,7 @@ RADIAL_GRID_POINTS = 4001
 RADIAL_GRID_SPACING = 0.0125
 EXCHANGE_U_ZERO = 1e-6
 OUTPUT_U_ZERO = 1e-10
+DEFAULT_RADIAL_CHUNK_SIZE = 64
 
 # Exchange-hole coefficients.
 EXCHANGE_H_COEFFS = (0.00979681, 0.041083, 0.187440, 0.00120824, 0.0347188)
@@ -224,6 +225,23 @@ def trapz_integral(y, x):
 def cumulative_integral(y, x):
     """Compute a cumulative trapezoid integral with finite cleanup."""
     return finite_or_zero(CUMTRAPZ(finite_or_zero(y), x, initial=0))
+
+
+def radial_chunk_size():
+    """Return the radial chunk size used for memory-bounded contractions."""
+    raw_value = os.environ.get("XCHOLEMODEL_RADIAL_CHUNK_SIZE", str(DEFAULT_RADIAL_CHUNK_SIZE))
+    try:
+        chunk_size = int(raw_value)
+    except ValueError:
+        chunk_size = DEFAULT_RADIAL_CHUNK_SIZE
+    return max(1, chunk_size)
+
+
+def radial_chunk_slices(npts):
+    """Yield radial-grid chunks without materializing full n_radial x n_grid arrays."""
+    chunk_size = radial_chunk_size()
+    for start in range(0, npts, chunk_size):
+        yield start, min(start + chunk_size, npts)
 
 
 def regularize_reduced_gradient(s, s1=PBE_S_REGULARIZATION_START, s2=PBE_S_REGULARIZATION_LIMIT):
@@ -620,30 +638,36 @@ def _compute_exchange_holes(grid, radial, fields, status=None):
         _log_substep(status, "Preparing exchange kernels and spin-scaled radii.")
     spin_scale_up = (1 + fields.zeta) ** (1 / 3) * fields.kf
     spin_scale_down = (1 - fields.zeta) ** (1 / 3) * fields.kf
-    x_up = np.outer(radial.exchange_u, spin_scale_up)
-    x_down = np.outer(radial.exchange_u, spin_scale_down)
     spin_density_up = (2 * grid.rho_up) ** 2
     spin_density_down = (2 * grid.rho_down) ** 2
 
     if status is not None:
-        _log_substep(status, "Contracting weighted exchange profiles over the grid.")
-    hx_lda = finite_or_zero(
-        (
-            (_j_lda_kernel(x_up) * spin_density_up + _j_lda_kernel(x_down) * spin_density_down)
-            @ grid.grid_weights
+        _log_substep(
+            status,
+            f"Contracting weighted exchange profiles over the grid in chunks of {radial_chunk_size()} radial points.",
         )
-        / (2 * grid.normalizer)
-    )
-    hx_pbe = finite_or_zero(
-        (
+    hx_lda = np.zeros(radial.npts, dtype=float)
+    hx_pbe = np.zeros(radial.npts, dtype=float)
+    for start, end in radial_chunk_slices(radial.npts):
+        x_up = np.outer(radial.exchange_u[start:end], spin_scale_up)
+        x_down = np.outer(radial.exchange_u[start:end], spin_scale_down)
+        hx_lda[start:end] = finite_or_zero(
             (
-                _j_gga_kernel(fields.s_up[np.newaxis, :], x_up) * spin_density_up
-                + _j_gga_kernel(fields.s_down[np.newaxis, :], x_down) * spin_density_down
+                (_j_lda_kernel(x_up) * spin_density_up + _j_lda_kernel(x_down) * spin_density_down)
+                @ grid.grid_weights
             )
-            @ grid.grid_weights
+            / (2 * grid.normalizer)
         )
-        / (2 * grid.normalizer)
-    )
+        hx_pbe[start:end] = finite_or_zero(
+            (
+                (
+                    _j_gga_kernel(fields.s_up[np.newaxis, :], x_up) * spin_density_up
+                    + _j_gga_kernel(fields.s_down[np.newaxis, :], x_down) * spin_density_down
+                )
+                @ grid.grid_weights
+            )
+            / (2 * grid.normalizer)
+        )
     return hx_lda, hx_pbe
 
 
@@ -774,6 +798,88 @@ def _interpolate_cutoff(v, cumulative_values):
     return vc
 
 
+def _correlation_chunk_terms(radial_u, fields, correlation_energy):
+    v = np.outer(radial_u, fields.phi * fields.ks)
+    v_sq = v**2
+    radial_scale = np.outer(radial_u, safe_divide(fields.kf, fields.phi))
+    exp_factor = safe_negexp(fields.correlation_d[np.newaxis, :] * radial_scale**2)
+    active_grid = fields.active_total[np.newaxis, :]
+    lda_correlation_kernel = _lda_correlation_kernel(
+        v,
+        v_sq,
+        exp_factor,
+        fields,
+        correlation_energy,
+        active_grid,
+    )
+    phi_ks_factor = (fields.phi**5 * fields.ks**2)[np.newaxis, :]
+    nc_lsd = finite_or_zero(phi_ks_factor * lda_correlation_kernel)
+    gga_correction_kernel = _gga_correction_kernel(v_sq, fields, active_grid)
+    gga_hole = finite_or_zero(lda_correlation_kernel + (fields.t**2)[np.newaxis, :] * gga_correction_kernel)
+    nc_gea = finite_or_zero(phi_ks_factor * gga_hole)
+    return v, v_sq, nc_lsd, gga_hole, nc_gea
+
+
+def _find_gga_cutoff(radial, fields, correlation_energy):
+    ngrid = fields.active_total.size
+    previous_v = None
+    previous_integrand = None
+    previous_cumulative = np.zeros(ngrid, dtype=float)
+    left_v = np.zeros(ngrid, dtype=float)
+    right_v = np.zeros(ngrid, dtype=float)
+    left_cumulative = np.zeros(ngrid, dtype=float)
+    right_cumulative = np.zeros(ngrid, dtype=float)
+    has_crossing = np.zeros(ngrid, dtype=bool)
+
+    for start, end in radial_chunk_slices(radial.npts):
+        v, v_sq, _, gga_hole, _ = _correlation_chunk_terms(radial.u_axis[start:end], fields, correlation_energy)
+        integrand = finite_or_zero(v_sq * gga_hole)
+
+        if previous_v is not None:
+            v_ext = np.vstack((previous_v[np.newaxis, :], v))
+            integrand_ext = np.vstack((previous_integrand[np.newaxis, :], integrand))
+            cumulative_ext = previous_cumulative[np.newaxis, :] + CUMTRAPZ(
+                integrand_ext,
+                v_ext,
+                axis=0,
+                initial=0,
+            )
+        else:
+            v_ext = v
+            cumulative_ext = CUMTRAPZ(integrand, v, axis=0, initial=0)
+
+        cumulative_ext = finite_or_zero(cumulative_ext)
+        sign_change = np.isfinite(cumulative_ext[1:]) & np.isfinite(cumulative_ext[:-1])
+        sign_change &= cumulative_ext[1:] * cumulative_ext[:-1] < 0
+        candidate_rows = np.arange(1, cumulative_ext.shape[0])[:, np.newaxis]
+        last_crossing = np.max(np.where(sign_change, candidate_rows, 0), axis=0)
+        crossing_columns = np.nonzero(last_crossing)[0]
+        if crossing_columns.size:
+            right_index = last_crossing[crossing_columns]
+            left_index = right_index - 1
+            left_v[crossing_columns] = v_ext[left_index, crossing_columns]
+            right_v[crossing_columns] = v_ext[right_index, crossing_columns]
+            left_cumulative[crossing_columns] = cumulative_ext[left_index, crossing_columns]
+            right_cumulative[crossing_columns] = cumulative_ext[right_index, crossing_columns]
+            has_crossing[crossing_columns] = True
+
+        previous_v = v[-1].copy()
+        previous_integrand = integrand[-1].copy()
+        previous_cumulative = cumulative_ext[-1].copy()
+
+    vc = np.zeros(ngrid, dtype=float)
+    denominator = right_cumulative - left_cumulative
+    good = has_crossing & np.isfinite(left_v) & np.isfinite(right_v)
+    good &= np.isfinite(left_cumulative) & np.isfinite(right_cumulative)
+    correction = safe_divide(left_cumulative * (right_v - left_v), denominator, where=good)
+    vc[good] = np.where(
+        np.abs(denominator[good]) > DENOM_FLOOR,
+        left_v[good] - correction[good],
+        right_v[good],
+    )
+    return finite_or_zero(vc)
+
+
 def _compute_correlation_holes(grid, radial, fields, status=None):
     if status is not None:
         _log_substep(status, "Evaluating PW92/LDA correlation ingredients.")
@@ -787,38 +893,24 @@ def _compute_correlation_holes(grid, radial, fields, status=None):
         + (ec_1 - ec_0) * spin_factor * fields.zeta**4
     )
 
-    v = np.outer(radial.u_axis, fields.phi * fields.ks)
-    v_sq = v**2
-    radial_scale = np.outer(radial.u_axis, safe_divide(fields.kf, fields.phi))
-    exp_factor = safe_negexp(fields.correlation_d[np.newaxis, :] * radial_scale**2)
-    active_grid = fields.active_total[np.newaxis, :]
-
-    lda_correlation_kernel = _lda_correlation_kernel(
-        v,
-        v_sq,
-        exp_factor,
-        fields,
-        correlation_energy,
-        active_grid,
-    )
-    phi_ks_factor = (fields.phi**5 * fields.ks**2)[np.newaxis, :]
-    nc_lsd = finite_or_zero(phi_ks_factor * lda_correlation_kernel)
-    hc_lda = finite_or_zero(((nc_lsd * grid.density_total[np.newaxis, :]) @ grid.grid_weights) / grid.normalizer)
+    if status is not None:
+        _log_substep(status, "Building the GGA correction and radial cutoff in memory-bounded chunks.")
+    vc = _find_gga_cutoff(radial, fields, correlation_energy)
 
     if status is not None:
-        _log_substep(status, "Building the GGA correction and radial cutoff.")
-    gga_correction_kernel = _gga_correction_kernel(v_sq, fields, active_grid)
-    gga_hole = finite_or_zero(lda_correlation_kernel + (fields.t**2)[np.newaxis, :] * gga_correction_kernel)
-    nc_gea = finite_or_zero(phi_ks_factor * gga_hole)
-
-    cumulative_hole = finite_or_zero(CUMTRAPZ(finite_or_zero(v_sq * gga_hole), v, axis=0, initial=0))
-    vc = _interpolate_cutoff(v, cumulative_hole)
-
-    nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
-    nc_gga[:, ~fields.active_total] = 0.0
-    if status is not None:
-        _log_substep(status, "Contracting correlation profiles over the grid.")
-    hc_pbe = finite_or_zero(((nc_gga * grid.density_total[np.newaxis, :]) @ grid.grid_weights) / grid.normalizer)
+        _log_substep(
+            status,
+            f"Contracting correlation profiles over the grid in chunks of {radial_chunk_size()} radial points.",
+        )
+    hc_lda = np.zeros(radial.npts, dtype=float)
+    hc_pbe = np.zeros(radial.npts, dtype=float)
+    density_weights = grid.density_total * grid.grid_weights
+    for start, end in radial_chunk_slices(radial.npts):
+        v, _, nc_lsd, _, nc_gea = _correlation_chunk_terms(radial.u_axis[start:end], fields, correlation_energy)
+        hc_lda[start:end] = finite_or_zero((nc_lsd @ density_weights) / grid.normalizer)
+        nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
+        nc_gga[:, ~fields.active_total] = 0.0
+        hc_pbe[start:end] = finite_or_zero((nc_gga @ density_weights) / grid.normalizer)
     return hc_lda, hc_pbe
 
 
