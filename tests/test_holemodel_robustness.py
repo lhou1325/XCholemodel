@@ -271,6 +271,34 @@ class HoleModelRobustnessTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "grd dataset"):
                 module._load_grid_data(bad_grd_path)
 
+    def test_one_channel_restricted_density_is_split_into_closed_shell_spins(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = {}
+            module = load_holemodel_module(store)
+            path = os.path.abspath(os.path.join(tmpdir, "restricted.plot"))
+            store[path] = {
+                "rho": np.array([[2.0, 0.0], [2.0, 0.0]], dtype=float),
+                "grd": np.array(
+                    [
+                        [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=float,
+                ),
+                "xyz": np.array([[0.0, 0.0, 0.0, 0.5], [0.1, 0.0, 0.0, 0.5]], dtype=float),
+            }
+
+            with mock.patch.dict(os.environ, {"XCHOLEMODEL_RESTRICTED_CLOSED_SHELL": "1"}):
+                grid = module._load_grid_data(path)
+
+            self.assertTrue(np.allclose(grid.rho_up, [1.0, 1.0]))
+            self.assertTrue(np.allclose(grid.rho_down, [1.0, 1.0]))
+            self.assertTrue(np.allclose(grid.grad_up[:, 0], [0.1, 0.2]))
+            self.assertTrue(np.allclose(grid.grad_down[:, 0], [0.1, 0.2]))
+            self.assertAlmostEqual(grid.electron_count_up, 1.0)
+            self.assertAlmostEqual(grid.electron_count_down, 1.0)
+            self.assertAlmostEqual(grid.electron_count_total, 2.0)
+
     def test_failure_path_reports_the_active_step(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = {}

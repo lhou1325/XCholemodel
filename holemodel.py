@@ -369,6 +369,15 @@ def _load_grid_data(path):
     if grad_up.shape[0] != rho_up.shape[0] or grad_down.shape[0] != rho_up.shape[0]:
         raise ValueError("grd dataset must align with rho along the grid dimension.")
 
+    rho_up, rho_down, grad_up, grad_down = _split_one_channel_closed_shell_density(
+        path,
+        rho_up,
+        rho_down,
+        grad_up,
+        grad_down,
+        grid_weights,
+    )
+
     density_total = rho_up + rho_down
     electron_count_up = float(np.dot(grid_weights, rho_up))
     electron_count_down = float(np.dot(grid_weights, rho_down))
@@ -387,6 +396,41 @@ def _load_grid_data(path):
         electron_count_down=electron_count_down,
         electron_count_total=electron_count_total,
         normalizer=normalizer,
+    )
+
+
+def _split_one_channel_closed_shell_density(path, rho_up, rho_down, grad_up, grad_down, grid_weights):
+    """Split QUEST restricted one-channel plots into alpha/beta halves.
+
+    Some QUEST restricted-density plot files store the full closed-shell density in
+    rho[:, 0] with rho[:, 1] nearly empty. XCholemodel needs spin densities, not a
+    storage-channel convention, otherwise a singlet is treated as fully polarized.
+    """
+    mode = os.environ.get("XCHOLEMODEL_RESTRICTED_CLOSED_SHELL", "auto").strip().lower()
+    if mode in {"0", "false", "no", "off"}:
+        return rho_up, rho_down, grad_up, grad_down
+
+    n_up = float(np.dot(grid_weights, rho_up))
+    n_down = float(np.dot(grid_weights, rho_down))
+    total = n_up + n_down
+    one_channel = min(abs(n_up), abs(n_down)) < max(1.0e-8, 1.0e-7 * max(abs(total), 1.0))
+    should_split = mode in {"1", "true", "yes", "force"}
+    if mode == "auto":
+        should_split = one_channel and total > 1.5
+    if not should_split:
+        return rho_up, rho_down, grad_up, grad_down
+
+    density_total = rho_up + rho_down
+    grad_total = grad_up + grad_down
+    print(
+        "Restricted closed-shell density split enabled: "
+        f"{os.path.basename(path)} N_up={n_up:.8f}, N_down={n_down:.8f}, N_tot={total:.8f}"
+    )
+    return (
+        0.5 * density_total,
+        0.5 * density_total,
+        0.5 * grad_total,
+        0.5 * grad_total,
     )
 
 
