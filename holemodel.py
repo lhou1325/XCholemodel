@@ -244,6 +244,23 @@ def radial_chunk_slices(npts):
         yield start, min(start + chunk_size, npts)
 
 
+def radial_chunk_count(npts):
+    return math.ceil(npts / radial_chunk_size())
+
+
+def model_thread_count():
+    raw_value = os.environ.get("XCHOLEMODEL_THREADS", "1")
+    try:
+        threads = int(raw_value)
+    except ValueError:
+        threads = 1
+    return max(1, threads)
+
+
+def chunk_memory_estimate_mib(radial_npts, grid_npts, arrays=4):
+    return radial_npts * grid_npts * arrays * 8 / (1024**2)
+
+
 def regularize_reduced_gradient(s, s1=PBE_S_REGULARIZATION_START, s2=PBE_S_REGULARIZATION_LIMIT):
     """Smooth very large reduced gradients to the stable PBE hole regime."""
     s = np.asarray(s, dtype=float)
@@ -296,6 +313,7 @@ def _log_run_header(status):
     print("XCholemodel progress")
     print(f"Input file: {status.input_path}")
     print(f"Planned steps: {status.total_steps}")
+    print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}")
 
 
 def _start_step(status, step_name, detail):
@@ -307,8 +325,25 @@ def _start_step(status, step_name, detail):
     print(f"    {detail}")
 
 
-def _log_substep(_, message):
-    print(f"    - {message}")
+def _log_substep(status, message):
+    if status is None:
+        print(f"    - {message}")
+        return
+    elapsed = time.monotonic() - status.run_start
+    print(f"    - {time.strftime('%H:%M:%S')} +{_format_seconds(elapsed)} | {message}")
+
+
+def _log_chunk_progress(status, phase, chunk_index, chunk_count, start, end, chunk_start):
+    if status is None:
+        return
+    interval = max(1, chunk_count // 4)
+    if chunk_index not in {1, chunk_count} and chunk_index % interval != 0:
+        return
+    elapsed = time.monotonic() - chunk_start
+    _log_substep(
+        status,
+        f"{phase} chunk {chunk_index}/{chunk_count} radial[{start}:{end}] done in {_format_seconds(elapsed)}",
+    )
 
 
 def _finish_step(status, detail=None):
@@ -667,20 +702,29 @@ def _j_gga_kernel(s, x):
 
 def _compute_exchange_holes(grid, radial, fields, status=None):
     if status is not None:
-        _log_substep(status, "Preparing exchange kernels and spin-scaled radii.")
+        _log_substep(
+            status,
+            "Preparing exchange kernels and spin-scaled radii. "
+            f"(grid={grid.density_total.size}, radial={radial.npts}, threads={model_thread_count()}).",
+        )
     spin_scale_up = (1 + fields.zeta) ** (1 / 3) * fields.kf
     spin_scale_down = (1 - fields.zeta) ** (1 / 3) * fields.kf
     spin_density_up = (2 * grid.rho_up) ** 2
     spin_density_down = (2 * grid.rho_down) ** 2
 
+    chunk_size = radial_chunk_size()
+    chunk_count = radial_chunk_count(radial.npts)
     if status is not None:
         _log_substep(
             status,
-            f"Contracting weighted exchange profiles over the grid in chunks of {radial_chunk_size()} radial points.",
+            "Contracting weighted exchange profiles over the grid "
+            f"in {chunk_count} chunks of {chunk_size} radial points "
+            f"(estimated chunk workspace={chunk_memory_estimate_mib(chunk_size, grid.density_total.size):.1f} MiB).",
         )
     hx_lda = np.zeros(radial.npts, dtype=float)
     hx_pbe = np.zeros(radial.npts, dtype=float)
-    for start, end in radial_chunk_slices(radial.npts):
+    for chunk_index, (start, end) in enumerate(radial_chunk_slices(radial.npts), start=1):
+        chunk_start = time.monotonic()
         x_up = np.outer(radial.exchange_u[start:end], spin_scale_up)
         x_down = np.outer(radial.exchange_u[start:end], spin_scale_down)
         hx_lda[start:end] = finite_or_zero(
@@ -700,6 +744,7 @@ def _compute_exchange_holes(grid, radial, fields, status=None):
             )
             / (2 * grid.normalizer)
         )
+        _log_chunk_progress(status, "exchange", chunk_index, chunk_count, start, end, chunk_start)
     return hx_lda, hx_pbe
 
 
@@ -852,7 +897,7 @@ def _correlation_chunk_terms(radial_u, fields, correlation_energy):
     return v, v_sq, nc_lsd, gga_hole, nc_gea
 
 
-def _find_gga_cutoff(radial, fields, correlation_energy):
+def _find_gga_cutoff(radial, fields, correlation_energy, status=None):
     ngrid = fields.active_total.size
     previous_v = None
     previous_integrand = None
@@ -863,7 +908,9 @@ def _find_gga_cutoff(radial, fields, correlation_energy):
     right_cumulative = np.zeros(ngrid, dtype=float)
     has_crossing = np.zeros(ngrid, dtype=bool)
 
-    for start, end in radial_chunk_slices(radial.npts):
+    chunk_count = radial_chunk_count(radial.npts)
+    for chunk_index, (start, end) in enumerate(radial_chunk_slices(radial.npts), start=1):
+        chunk_start = time.monotonic()
         v, v_sq, _, gga_hole, _ = _correlation_chunk_terms(radial.u_axis[start:end], fields, correlation_energy)
         integrand = finite_or_zero(v_sq * gga_hole)
 
@@ -898,6 +945,7 @@ def _find_gga_cutoff(radial, fields, correlation_energy):
         previous_v = v[-1].copy()
         previous_integrand = integrand[-1].copy()
         previous_cumulative = cumulative_ext[-1].copy()
+        _log_chunk_progress(status, "correlation cutoff", chunk_index, chunk_count, start, end, chunk_start)
 
     vc = np.zeros(ngrid, dtype=float)
     denominator = right_cumulative - left_cumulative
@@ -926,23 +974,33 @@ def _compute_correlation_holes(grid, radial, fields, status=None):
     )
 
     if status is not None:
-        _log_substep(status, "Building the GGA correction and radial cutoff in memory-bounded chunks.")
-    vc = _find_gga_cutoff(radial, fields, correlation_energy)
+        _log_substep(
+            status,
+            "Building the GGA correction and radial cutoff in "
+            f"{radial_chunk_count(radial.npts)} memory-bounded chunks.",
+        )
+    vc = _find_gga_cutoff(radial, fields, correlation_energy, status=status)
 
+    chunk_size = radial_chunk_size()
+    chunk_count = radial_chunk_count(radial.npts)
     if status is not None:
         _log_substep(
             status,
-            f"Contracting correlation profiles over the grid in chunks of {radial_chunk_size()} radial points.",
+            "Contracting correlation profiles over the grid "
+            f"in {chunk_count} chunks of {chunk_size} radial points "
+            f"(estimated chunk workspace={chunk_memory_estimate_mib(chunk_size, grid.density_total.size, arrays=5):.1f} MiB).",
         )
     hc_lda = np.zeros(radial.npts, dtype=float)
     hc_pbe = np.zeros(radial.npts, dtype=float)
     density_weights = grid.density_total * grid.grid_weights
-    for start, end in radial_chunk_slices(radial.npts):
+    for chunk_index, (start, end) in enumerate(radial_chunk_slices(radial.npts), start=1):
+        chunk_start = time.monotonic()
         v, _, nc_lsd, _, nc_gea = _correlation_chunk_terms(radial.u_axis[start:end], fields, correlation_energy)
         hc_lda[start:end] = finite_or_zero((nc_lsd @ density_weights) / grid.normalizer)
         nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
         nc_gga[:, ~fields.active_total] = 0.0
         hc_pbe[start:end] = finite_or_zero((nc_gga @ density_weights) / grid.normalizer)
+        _log_chunk_progress(status, "correlation", chunk_index, chunk_count, start, end, chunk_start)
     return hc_lda, hc_pbe
 
 
