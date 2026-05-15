@@ -65,6 +65,7 @@ def load_holemodel_module(store):
             else:
                 self.datasets = {}
                 store[self.path] = self.datasets
+            self.attrs = self.datasets.get("_attrs", {})
 
         def __getitem__(self, key):
             return self.datasets[key]
@@ -300,6 +301,53 @@ class HoleModelRobustnessTests(unittest.TestCase):
             self.assertAlmostEqual(grid.electron_count_up, 1.0)
             self.assertAlmostEqual(grid.electron_count_down, 1.0)
             self.assertAlmostEqual(grid.electron_count_total, 2.0)
+
+    def test_auto_split_tolerates_quest_empty_channel_density_floor(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = {}
+            module = load_holemodel_module(store)
+            path = os.path.abspath(os.path.join(tmpdir, "restricted_floor.plot"))
+            store[path] = {
+                "rho": np.array([[2.0, 1e-5], [2.0, 1e-5]], dtype=float),
+                "grd": np.array(
+                    [
+                        [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=float,
+                ),
+                "xyz": np.array([[0.0, 0.0, 0.0, 0.5], [0.1, 0.0, 0.0, 0.5]], dtype=float),
+            }
+
+            grid = module._load_grid_data(path)
+
+            self.assertTrue(np.allclose(grid.rho_up, [1.000005, 1.000005]))
+            self.assertTrue(np.allclose(grid.rho_down, [1.000005, 1.000005]))
+            self.assertAlmostEqual(grid.electron_count_up, 1.000005)
+            self.assertAlmostEqual(grid.electron_count_down, 1.000005)
+
+    def test_auto_split_honors_restricted_total_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = {}
+            module = load_holemodel_module(store)
+            path = os.path.abspath(os.path.join(tmpdir, "restricted_metadata.plot"))
+            store[path] = {
+                "_attrs": {"rho_channel_convention": "restricted_total_in_rho0"},
+                "rho": np.array([[2.0, 1e-4], [2.0, 1e-4]], dtype=float),
+                "grd": np.array(
+                    [
+                        [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=float,
+                ),
+                "xyz": np.array([[0.0, 0.0, 0.0, 0.5], [0.1, 0.0, 0.0, 0.5]], dtype=float),
+            }
+
+            grid = module._load_grid_data(path)
+
+            self.assertTrue(np.allclose(grid.rho_up, [1.00005, 1.00005]))
+            self.assertTrue(np.allclose(grid.rho_down, [1.00005, 1.00005]))
 
     def test_failure_path_reports_the_active_step(self):
         with tempfile.TemporaryDirectory() as tmpdir:

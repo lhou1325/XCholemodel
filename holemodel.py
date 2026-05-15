@@ -431,10 +431,18 @@ def _split_one_channel_closed_shell_density(path, rho_up, rho_down, grad_up, gra
     n_up = float(np.dot(grid_weights, rho_up))
     n_down = float(np.dot(grid_weights, rho_down))
     total = n_up + n_down
-    one_channel = min(abs(n_up), abs(n_down)) < max(1.0e-8, 1.0e-7 * max(abs(total), 1.0))
+    minor_population = min(abs(n_up), abs(n_down))
+    major_population = max(abs(n_up), abs(n_down))
+    minor_peak = min(float(np.max(np.abs(rho_up))), float(np.max(np.abs(rho_down))))
+    major_peak = max(float(np.max(np.abs(rho_up))), float(np.max(np.abs(rho_down))), RHO_FLOOR)
+    population_ratio = safe_divide(minor_population, max(abs(total), 1.0))
+    peak_ratio = safe_divide(minor_peak, major_peak)
+    one_channel = population_ratio < 1.0e-4 and peak_ratio < 1.0e-4
+    metadata_requests_split = _restricted_metadata_requests_closed_shell_split(path)
+
     should_split = mode in {"1", "true", "yes", "force"}
     if mode == "auto":
-        should_split = one_channel and total > 1.5
+        should_split = metadata_requests_split or (one_channel and total > 1.5 and major_population > 0.5)
     if not should_split:
         return rho_up, rho_down, grad_up, grad_down
 
@@ -442,7 +450,8 @@ def _split_one_channel_closed_shell_density(path, rho_up, rho_down, grad_up, gra
     grad_total = grad_up + grad_down
     print(
         "Restricted closed-shell density split enabled: "
-        f"{os.path.basename(path)} N_up={n_up:.8f}, N_down={n_down:.8f}, N_tot={total:.8f}"
+        f"{os.path.basename(path)} N_up={n_up:.8f}, N_down={n_down:.8f}, N_tot={total:.8f}, "
+        f"minor/total={float(population_ratio):.3e}, minor/major_peak={float(peak_ratio):.3e}"
     )
     return (
         0.5 * density_total,
@@ -450,6 +459,29 @@ def _split_one_channel_closed_shell_density(path, rho_up, rho_down, grad_up, gra
         0.5 * grad_total,
         0.5 * grad_total,
     )
+
+
+def _restricted_metadata_requests_closed_shell_split(path):
+    """Return True when QUEST plot metadata declares restricted one-channel storage."""
+    try:
+        density_file = h5py.File(path, "r")
+    except Exception:
+        return False
+    try:
+        attrs = getattr(density_file, "attrs", {})
+        spin_treatment = _metadata_text(attrs.get("spin_treatment", "")).upper()
+        rho_convention = _metadata_text(attrs.get("rho_channel_convention", "")).lower()
+    finally:
+        density_file.close()
+    return rho_convention == "restricted_total_in_rho0" or (
+        spin_treatment == "RESTRICTED" and "restricted_total" in rho_convention
+    )
+
+
+def _metadata_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _build_radial_grid():
