@@ -10,6 +10,7 @@ For each input file, the script writes a text energy summary and an HDF5
 """
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 import sys
@@ -259,6 +260,21 @@ def model_thread_count():
 
 def chunk_memory_estimate_mib(radial_npts, grid_npts, arrays=4):
     return radial_npts * grid_npts * arrays * 8 / (1024**2)
+
+
+def max_workspace_mib():
+    raw_value = os.environ.get("XCHOLEMODEL_MAX_WORKSPACE_MIB", "4096")
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = 4096.0
+    return max(1.0, value)
+
+
+def effective_worker_count(chunk_count, chunk_mib):
+    requested = min(model_thread_count(), max(1, chunk_count))
+    memory_limited = max(1, int(max_workspace_mib() // max(chunk_mib, 1.0e-9)))
+    return max(1, min(requested, memory_limited))
 
 
 def regularize_reduced_gradient(s, s1=PBE_S_REGULARIZATION_START, s2=PBE_S_REGULARIZATION_LIMIT):
@@ -714,27 +730,31 @@ def _compute_exchange_holes(grid, radial, fields, status=None):
 
     chunk_size = radial_chunk_size()
     chunk_count = radial_chunk_count(radial.npts)
+    chunk_mib = chunk_memory_estimate_mib(chunk_size, grid.density_total.size)
+    workers = effective_worker_count(chunk_count, chunk_mib)
     if status is not None:
         _log_substep(
             status,
             "Contracting weighted exchange profiles over the grid "
             f"in {chunk_count} chunks of {chunk_size} radial points "
-            f"(estimated chunk workspace={chunk_memory_estimate_mib(chunk_size, grid.density_total.size):.1f} MiB).",
+            f"(workers={workers}, estimated chunk workspace={chunk_mib:.1f} MiB).",
         )
     hx_lda = np.zeros(radial.npts, dtype=float)
     hx_pbe = np.zeros(radial.npts, dtype=float)
-    for chunk_index, (start, end) in enumerate(radial_chunk_slices(radial.npts), start=1):
+
+    def compute_chunk(bounds):
+        start, end = bounds
         chunk_start = time.monotonic()
         x_up = np.outer(radial.exchange_u[start:end], spin_scale_up)
         x_down = np.outer(radial.exchange_u[start:end], spin_scale_down)
-        hx_lda[start:end] = finite_or_zero(
+        hx_lda_chunk = finite_or_zero(
             (
                 (_j_lda_kernel(x_up) * spin_density_up + _j_lda_kernel(x_down) * spin_density_down)
                 @ grid.grid_weights
             )
             / (2 * grid.normalizer)
         )
-        hx_pbe[start:end] = finite_or_zero(
+        hx_pbe_chunk = finite_or_zero(
             (
                 (
                     _j_gga_kernel(fields.s_up[np.newaxis, :], x_up) * spin_density_up
@@ -744,7 +764,22 @@ def _compute_exchange_holes(grid, radial, fields, status=None):
             )
             / (2 * grid.normalizer)
         )
-        _log_chunk_progress(status, "exchange", chunk_index, chunk_count, start, end, chunk_start)
+        return start, end, hx_lda_chunk, hx_pbe_chunk, chunk_start
+
+    chunks = list(radial_chunk_slices(radial.npts))
+    if workers == 1:
+        results = map(compute_chunk, chunks)
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        results = executor.map(compute_chunk, chunks)
+    try:
+        for chunk_index, (start, end, hx_lda_chunk, hx_pbe_chunk, chunk_start) in enumerate(results, start=1):
+            hx_lda[start:end] = hx_lda_chunk
+            hx_pbe[start:end] = hx_pbe_chunk
+            _log_chunk_progress(status, "exchange", chunk_index, chunk_count, start, end, chunk_start)
+    finally:
+        if workers != 1:
+            executor.shutdown()
     return hx_lda, hx_pbe
 
 
@@ -983,24 +1018,43 @@ def _compute_correlation_holes(grid, radial, fields, status=None):
 
     chunk_size = radial_chunk_size()
     chunk_count = radial_chunk_count(radial.npts)
+    chunk_mib = chunk_memory_estimate_mib(chunk_size, grid.density_total.size, arrays=5)
+    workers = effective_worker_count(chunk_count, chunk_mib)
     if status is not None:
         _log_substep(
             status,
             "Contracting correlation profiles over the grid "
             f"in {chunk_count} chunks of {chunk_size} radial points "
-            f"(estimated chunk workspace={chunk_memory_estimate_mib(chunk_size, grid.density_total.size, arrays=5):.1f} MiB).",
+            f"(workers={workers}, estimated chunk workspace={chunk_mib:.1f} MiB).",
         )
     hc_lda = np.zeros(radial.npts, dtype=float)
     hc_pbe = np.zeros(radial.npts, dtype=float)
     density_weights = grid.density_total * grid.grid_weights
-    for chunk_index, (start, end) in enumerate(radial_chunk_slices(radial.npts), start=1):
+
+    def compute_chunk(bounds):
+        start, end = bounds
         chunk_start = time.monotonic()
         v, _, nc_lsd, _, nc_gea = _correlation_chunk_terms(radial.u_axis[start:end], fields, correlation_energy)
-        hc_lda[start:end] = finite_or_zero((nc_lsd @ density_weights) / grid.normalizer)
+        hc_lda_chunk = finite_or_zero((nc_lsd @ density_weights) / grid.normalizer)
         nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
         nc_gga[:, ~fields.active_total] = 0.0
-        hc_pbe[start:end] = finite_or_zero((nc_gga @ density_weights) / grid.normalizer)
-        _log_chunk_progress(status, "correlation", chunk_index, chunk_count, start, end, chunk_start)
+        hc_pbe_chunk = finite_or_zero((nc_gga @ density_weights) / grid.normalizer)
+        return start, end, hc_lda_chunk, hc_pbe_chunk, chunk_start
+
+    chunks = list(radial_chunk_slices(radial.npts))
+    if workers == 1:
+        results = map(compute_chunk, chunks)
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        results = executor.map(compute_chunk, chunks)
+    try:
+        for chunk_index, (start, end, hc_lda_chunk, hc_pbe_chunk, chunk_start) in enumerate(results, start=1):
+            hc_lda[start:end] = hc_lda_chunk
+            hc_pbe[start:end] = hc_pbe_chunk
+            _log_chunk_progress(status, "correlation", chunk_index, chunk_count, start, end, chunk_start)
+    finally:
+        if workers != 1:
+            executor.shutdown()
     return hc_lda, hc_pbe
 
 
