@@ -349,6 +349,78 @@ class HoleModelRobustnessTests(unittest.TestCase):
             self.assertTrue(np.allclose(grid.rho_up, [1.00005, 1.00005]))
             self.assertTrue(np.allclose(grid.rho_down, [1.00005, 1.00005]))
 
+    def test_restricted_metadata_matches_equivalent_unrestricted_closed_shell(self):
+        total_rho = np.array([1.6, 1.4, 1.2, 0.9, 0.7, 0.4], dtype=float)
+        total_grad = np.array(
+            [
+                [0.08, 0.01, 0.00],
+                [0.05, 0.02, 0.01],
+                [0.02, 0.03, 0.02],
+                [0.01, 0.01, 0.03],
+                [0.02, 0.00, 0.01],
+                [0.01, 0.02, 0.00],
+            ],
+            dtype=float,
+        )
+        xyz = np.array(
+            [
+                [0.0, 0.0, 0.0, 0.10],
+                [0.1, 0.0, 0.0, 0.15],
+                [0.2, 0.0, 0.0, 0.20],
+                [0.3, 0.0, 0.0, 0.20],
+                [0.4, 0.0, 0.0, 0.20],
+                [0.5, 0.0, 0.0, 0.15],
+            ],
+            dtype=float,
+        )
+        restricted_grd = np.zeros((total_rho.size, 7), dtype=float)
+        restricted_grd[:, 0:3] = total_grad
+        unrestricted_grd = np.zeros((total_rho.size, 7), dtype=float)
+        unrestricted_grd[:, 0:3] = 0.5 * total_grad
+        unrestricted_grd[:, 4:7] = 0.5 * total_grad
+
+        store = {}
+        module = load_holemodel_module(store)
+        restricted_metrics, _, restricted_plot, _ = run_model(
+            module,
+            store,
+            "restricted_equiv",
+            {
+                "_attrs": {
+                    "spin_treatment": "RESTRICTED",
+                    "rho_channel_convention": "restricted_total_in_rho0",
+                },
+                "rho": np.column_stack([total_rho, np.zeros_like(total_rho)]),
+                "grd": restricted_grd,
+                "xyz": xyz,
+            },
+        )
+        unrestricted_metrics, _, unrestricted_plot, _ = run_model(
+            module,
+            store,
+            "unrestricted_equiv",
+            {
+                "_attrs": {
+                    "spin_treatment": "UNRESTRICTED",
+                    "rho_channel_convention": "unrestricted_alpha_beta",
+                },
+                "rho": np.column_stack([0.5 * total_rho, 0.5 * total_rho]),
+                "grd": unrestricted_grd,
+                "xyz": xyz,
+            },
+        )
+
+        for key in ("LDA:Ex", "LDA:Ec", "LDA:Exc", "PBE:Ex", "PBE:Ec", "PBE:Exc"):
+            self.assertTrue(
+                np.isclose(restricted_metrics[key], unrestricted_metrics[key], rtol=1e-10, atol=1e-12),
+                msg=key,
+            )
+        for key in ("LDA_X", "LDA_C", "LDA_XC", "PBE_X", "PBE_C", "PBE_XC"):
+            self.assertTrue(
+                np.allclose(restricted_plot[key], unrestricted_plot[key], rtol=1e-10, atol=1e-12),
+                msg=key,
+            )
+
     def test_failure_path_reports_the_active_step(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = {}
