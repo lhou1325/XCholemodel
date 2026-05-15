@@ -43,6 +43,7 @@ RADIAL_GRID_SPACING = 0.0125
 EXCHANGE_U_ZERO = 1e-6
 OUTPUT_U_ZERO = 1e-10
 DEFAULT_RADIAL_CHUNK_SIZE = 64
+DEFAULT_MODEL_THREADS = 8
 CORRELATION_U_ZERO = 1e-6
 
 # Exchange-hole coefficients.
@@ -251,7 +252,7 @@ def radial_chunk_count(npts):
 
 
 def model_thread_count():
-    raw_value = os.environ.get("XCHOLEMODEL_THREADS", "1")
+    raw_value = os.environ.get("XCHOLEMODEL_THREADS", str(DEFAULT_MODEL_THREADS))
     try:
         threads = int(raw_value)
     except ValueError:
