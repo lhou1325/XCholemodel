@@ -43,6 +43,7 @@ RADIAL_GRID_SPACING = 0.0125
 EXCHANGE_U_ZERO = 1e-6
 OUTPUT_U_ZERO = 1e-10
 DEFAULT_RADIAL_CHUNK_SIZE = 64
+CORRELATION_U_ZERO = 1e-6
 
 # Exchange-hole coefficients.
 EXCHANGE_H_COEFFS = (0.00979681, 0.041083, 0.187440, 0.00120824, 0.0347188)
@@ -911,9 +912,10 @@ def _interpolate_cutoff(v, cumulative_values):
 
 
 def _correlation_chunk_terms(radial_u, fields, correlation_energy):
-    v = np.outer(radial_u, fields.phi * fields.ks)
+    stable_radial_u = np.maximum(radial_u, CORRELATION_U_ZERO)
+    v = np.outer(stable_radial_u, fields.phi * fields.ks)
     v_sq = v**2
-    radial_scale = np.outer(radial_u, safe_divide(fields.kf, fields.phi))
+    radial_scale = np.outer(stable_radial_u, safe_divide(fields.kf, fields.phi))
     exp_factor = safe_negexp(fields.correlation_d[np.newaxis, :] * radial_scale**2)
     active_grid = fields.active_total[np.newaxis, :]
     lda_correlation_kernel = _lda_correlation_kernel(
