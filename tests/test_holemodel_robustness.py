@@ -533,6 +533,24 @@ class HoleModelRobustnessTests(unittest.TestCase):
         self.assert_valid_plot_output(plot_output)
         self.assertIn("chunks of 7 radial points", console_output)
 
+    def test_single_point_radial_chunks_preserve_scalar_outputs(self):
+        store = {}
+        module = load_holemodel_module(store)
+        with mock.patch.dict(os.environ, {"XCHOLEMODEL_RADIAL_CHUNK_SIZE": "1"}):
+            text_metrics, text_body, plot_output, console_output = run_model(
+                module,
+                store,
+                "pathological_single_chunk",
+                pathological_input(),
+            )
+
+        self.assertNotIn("nan", text_body.lower())
+        self.assertNotIn("inf", text_body.lower())
+        self.assert_metrics_close(text_metrics, EXPECTED_PATHOLOGICAL_SCALARS)
+        self.assert_valid_plot_output(plot_output)
+        self.assertIn("chunks of 1 radial points", console_output)
+        self.assertIn("radial cutoff in 2001 memory-bounded chunks", console_output)
+
     def test_output_schema_and_finiteness_for_fixture_outputs(self):
         fixtures = {
             "pathological": pathological_input,

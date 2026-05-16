@@ -240,15 +240,15 @@ def radial_chunk_size():
     return max(1, chunk_size)
 
 
-def radial_chunk_slices(npts):
+def radial_chunk_slices(npts, minimum=1):
     """Yield radial-grid chunks without materializing full n_radial x n_grid arrays."""
-    chunk_size = radial_chunk_size()
+    chunk_size = max(radial_chunk_size(), minimum)
     for start in range(0, npts, chunk_size):
         yield start, min(start + chunk_size, npts)
 
 
-def radial_chunk_count(npts):
-    return math.ceil(npts / radial_chunk_size())
+def radial_chunk_count(npts, minimum=1):
+    return math.ceil(npts / max(radial_chunk_size(), minimum))
 
 
 def model_thread_count():
@@ -945,8 +945,8 @@ def _find_gga_cutoff(radial, fields, correlation_energy, status=None):
     right_cumulative = np.zeros(ngrid, dtype=float)
     has_crossing = np.zeros(ngrid, dtype=bool)
 
-    chunk_count = radial_chunk_count(radial.npts)
-    for chunk_index, (start, end) in enumerate(radial_chunk_slices(radial.npts), start=1):
+    chunk_count = radial_chunk_count(radial.npts, minimum=2)
+    for chunk_index, (start, end) in enumerate(radial_chunk_slices(radial.npts, minimum=2), start=1):
         chunk_start = time.monotonic()
         v, v_sq, _, gga_hole, _ = _correlation_chunk_terms(radial.u_axis[start:end], fields, correlation_energy)
         integrand = finite_or_zero(v_sq * gga_hole)
@@ -1014,7 +1014,7 @@ def _compute_correlation_holes(grid, radial, fields, status=None):
         _log_substep(
             status,
             "Building the GGA correction and radial cutoff in "
-            f"{radial_chunk_count(radial.npts)} memory-bounded chunks.",
+            f"{radial_chunk_count(radial.npts, minimum=2)} memory-bounded chunks.",
         )
     vc = _find_gga_cutoff(radial, fields, correlation_energy, status=status)
 
