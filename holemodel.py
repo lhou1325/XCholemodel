@@ -490,12 +490,11 @@ def _split_one_channel_closed_shell_density(path, rho_up, rho_down, grad_up, gra
     major_peak = max(float(np.max(np.abs(rho_up))), float(np.max(np.abs(rho_down))), RHO_FLOOR)
     population_ratio = safe_divide(minor_population, max(abs(total), 1.0))
     peak_ratio = safe_divide(minor_peak, major_peak)
-    one_channel = population_ratio < 1.0e-4 and peak_ratio < 1.0e-4
     metadata_requests_split = _restricted_metadata_requests_closed_shell_split(path)
 
     should_split = mode in {"1", "true", "yes", "force"}
     if mode == "auto":
-        should_split = metadata_requests_split or (one_channel and total > 1.5 and major_population > 0.5)
+        should_split = metadata_requests_split
     if not should_split:
         return rho_up, rho_down, grad_up, grad_down
 

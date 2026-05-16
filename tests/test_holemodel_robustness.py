@@ -302,7 +302,7 @@ class HoleModelRobustnessTests(unittest.TestCase):
             self.assertAlmostEqual(grid.electron_count_down, 1.0)
             self.assertAlmostEqual(grid.electron_count_total, 2.0)
 
-    def test_auto_split_tolerates_quest_empty_channel_density_floor(self):
+    def test_force_split_tolerates_quest_empty_channel_density_floor(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = {}
             module = load_holemodel_module(store)
@@ -319,12 +319,65 @@ class HoleModelRobustnessTests(unittest.TestCase):
                 "xyz": np.array([[0.0, 0.0, 0.0, 0.5], [0.1, 0.0, 0.0, 0.5]], dtype=float),
             }
 
-            grid = module._load_grid_data(path)
+            with mock.patch.dict(os.environ, {"XCHOLEMODEL_RESTRICTED_CLOSED_SHELL": "force"}):
+                grid = module._load_grid_data(path)
 
             self.assertTrue(np.allclose(grid.rho_up, [1.000005, 1.000005]))
             self.assertTrue(np.allclose(grid.rho_down, [1.000005, 1.000005]))
             self.assertAlmostEqual(grid.electron_count_up, 1.000005)
             self.assertAlmostEqual(grid.electron_count_down, 1.000005)
+
+    def test_auto_split_leaves_metadata_less_one_channel_unrestricted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = {}
+            module = load_holemodel_module(store)
+            path = os.path.abspath(os.path.join(tmpdir, "metadata_less_one_channel.plot"))
+            store[path] = {
+                "rho": np.array([[2.0, 1e-5], [2.0, 1e-5]], dtype=float),
+                "grd": np.array(
+                    [
+                        [0.2, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                        [0.4, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    ],
+                    dtype=float,
+                ),
+                "xyz": np.array([[0.0, 0.0, 0.0, 0.5], [0.1, 0.0, 0.0, 0.5]], dtype=float),
+            }
+
+            grid = module._load_grid_data(path)
+
+            self.assertTrue(np.allclose(grid.rho_up, [2.0, 2.0]))
+            self.assertTrue(np.allclose(grid.rho_down, [1e-5, 1e-5]))
+            self.assertAlmostEqual(grid.electron_count_up, 2.0)
+            self.assertAlmostEqual(grid.electron_count_down, 1e-5)
+
+    def test_auto_split_honors_unrestricted_metadata(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = {}
+            module = load_holemodel_module(store)
+            path = os.path.abspath(os.path.join(tmpdir, "unrestricted_one_channel.plot"))
+            store[path] = {
+                "_attrs": {
+                    "spin_treatment": "UNRESTRICTED",
+                    "rho_channel_convention": "unrestricted_alpha_beta",
+                },
+                "rho": np.array([[2.0, 1e-5], [2.0, 1e-5]], dtype=float),
+                "grd": np.array(
+                    [
+                        [0.2, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0],
+                        [0.4, 0.0, 0.0, 0.0, 1e-6, 0.0, 0.0],
+                    ],
+                    dtype=float,
+                ),
+                "xyz": np.array([[0.0, 0.0, 0.0, 0.5], [0.1, 0.0, 0.0, 0.5]], dtype=float),
+            }
+
+            grid = module._load_grid_data(path)
+
+            self.assertTrue(np.allclose(grid.rho_up, [2.0, 2.0]))
+            self.assertTrue(np.allclose(grid.rho_down, [1e-5, 1e-5]))
+            self.assertTrue(np.allclose(grid.grad_up[:, 0], [0.2, 0.4]))
+            self.assertTrue(np.allclose(grid.grad_down[:, 0], [1e-6, 1e-6]))
 
     def test_auto_split_honors_restricted_total_metadata(self):
         with tempfile.TemporaryDirectory() as tmpdir:
