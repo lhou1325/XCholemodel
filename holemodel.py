@@ -10,6 +10,7 @@ For each input file, the script writes a text energy summary and an HDF5
 """
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import math
 import os
 import sys
@@ -41,6 +42,9 @@ RADIAL_GRID_POINTS = 4001
 RADIAL_GRID_SPACING = 0.0125
 EXCHANGE_U_ZERO = 1e-6
 OUTPUT_U_ZERO = 1e-10
+DEFAULT_RADIAL_CHUNK_SIZE = 64
+DEFAULT_MODEL_THREADS = 8
+CORRELATION_U_ZERO = 1e-6
 
 # Exchange-hole coefficients.
 EXCHANGE_H_COEFFS = (0.00979681, 0.041083, 0.187440, 0.00120824, 0.0347188)
@@ -226,6 +230,55 @@ def cumulative_integral(y, x):
     return finite_or_zero(CUMTRAPZ(finite_or_zero(y), x, initial=0))
 
 
+def radial_chunk_size():
+    """Return the radial chunk size used for memory-bounded contractions."""
+    raw_value = os.environ.get("XCHOLEMODEL_RADIAL_CHUNK_SIZE", str(DEFAULT_RADIAL_CHUNK_SIZE))
+    try:
+        chunk_size = int(raw_value)
+    except ValueError:
+        chunk_size = DEFAULT_RADIAL_CHUNK_SIZE
+    return max(1, chunk_size)
+
+
+def radial_chunk_slices(npts, minimum=1):
+    """Yield radial-grid chunks without materializing full n_radial x n_grid arrays."""
+    chunk_size = max(radial_chunk_size(), minimum)
+    for start in range(0, npts, chunk_size):
+        yield start, min(start + chunk_size, npts)
+
+
+def radial_chunk_count(npts, minimum=1):
+    return math.ceil(npts / max(radial_chunk_size(), minimum))
+
+
+def model_thread_count():
+    raw_value = os.environ.get("XCHOLEMODEL_THREADS", str(DEFAULT_MODEL_THREADS))
+    try:
+        threads = int(raw_value)
+    except ValueError:
+        threads = 1
+    return max(1, threads)
+
+
+def chunk_memory_estimate_mib(radial_npts, grid_npts, arrays=4):
+    return radial_npts * grid_npts * arrays * 8 / (1024**2)
+
+
+def max_workspace_mib():
+    raw_value = os.environ.get("XCHOLEMODEL_MAX_WORKSPACE_MIB", "4096")
+    try:
+        value = float(raw_value)
+    except ValueError:
+        value = 4096.0
+    return max(1.0, value)
+
+
+def effective_worker_count(chunk_count, chunk_mib):
+    requested = min(model_thread_count(), max(1, chunk_count))
+    memory_limited = max(1, int(max_workspace_mib() // max(chunk_mib, 1.0e-9)))
+    return max(1, min(requested, memory_limited))
+
+
 def regularize_reduced_gradient(s, s1=PBE_S_REGULARIZATION_START, s2=PBE_S_REGULARIZATION_LIMIT):
     """Smooth very large reduced gradients to the stable PBE hole regime."""
     s = np.asarray(s, dtype=float)
@@ -278,6 +331,7 @@ def _log_run_header(status):
     print("XCholemodel progress")
     print(f"Input file: {status.input_path}")
     print(f"Planned steps: {status.total_steps}")
+    print(f"Started: {time.strftime('%Y-%m-%dT%H:%M:%S%z')}")
 
 
 def _start_step(status, step_name, detail):
@@ -289,8 +343,25 @@ def _start_step(status, step_name, detail):
     print(f"    {detail}")
 
 
-def _log_substep(_, message):
-    print(f"    - {message}")
+def _log_substep(status, message):
+    if status is None:
+        print(f"    - {message}")
+        return
+    elapsed = time.monotonic() - status.run_start
+    print(f"    - {time.strftime('%H:%M:%S')} +{_format_seconds(elapsed)} | {message}")
+
+
+def _log_chunk_progress(status, phase, chunk_index, chunk_count, start, end, chunk_start):
+    if status is None:
+        return
+    interval = max(1, chunk_count // 4)
+    if chunk_index not in {1, chunk_count} and chunk_index % interval != 0:
+        return
+    elapsed = time.monotonic() - chunk_start
+    _log_substep(
+        status,
+        f"{phase} chunk {chunk_index}/{chunk_count} radial[{start}:{end}] done in {_format_seconds(elapsed)}",
+    )
 
 
 def _finish_step(status, detail=None):
@@ -369,6 +440,15 @@ def _load_grid_data(path):
     if grad_up.shape[0] != rho_up.shape[0] or grad_down.shape[0] != rho_up.shape[0]:
         raise ValueError("grd dataset must align with rho along the grid dimension.")
 
+    rho_up, rho_down, grad_up, grad_down = _split_one_channel_closed_shell_density(
+        path,
+        rho_up,
+        rho_down,
+        grad_up,
+        grad_down,
+        grid_weights,
+    )
+
     density_total = rho_up + rho_down
     electron_count_up = float(np.dot(grid_weights, rho_up))
     electron_count_down = float(np.dot(grid_weights, rho_down))
@@ -388,6 +468,72 @@ def _load_grid_data(path):
         electron_count_total=electron_count_total,
         normalizer=normalizer,
     )
+
+
+def _split_one_channel_closed_shell_density(path, rho_up, rho_down, grad_up, grad_down, grid_weights):
+    """Split QUEST restricted one-channel plots into alpha/beta halves.
+
+    Some QUEST restricted-density plot files store the full closed-shell density in
+    rho[:, 0] with rho[:, 1] nearly empty. XCholemodel needs spin densities, not a
+    storage-channel convention, otherwise a singlet is treated as fully polarized.
+    """
+    mode = os.environ.get("XCHOLEMODEL_RESTRICTED_CLOSED_SHELL", "auto").strip().lower()
+    if mode in {"0", "false", "no", "off"}:
+        return rho_up, rho_down, grad_up, grad_down
+
+    n_up = float(np.dot(grid_weights, rho_up))
+    n_down = float(np.dot(grid_weights, rho_down))
+    total = n_up + n_down
+    minor_population = min(abs(n_up), abs(n_down))
+    major_population = max(abs(n_up), abs(n_down))
+    minor_peak = min(float(np.max(np.abs(rho_up))), float(np.max(np.abs(rho_down))))
+    major_peak = max(float(np.max(np.abs(rho_up))), float(np.max(np.abs(rho_down))), RHO_FLOOR)
+    population_ratio = safe_divide(minor_population, max(abs(total), 1.0))
+    peak_ratio = safe_divide(minor_peak, major_peak)
+    metadata_requests_split = _restricted_metadata_requests_closed_shell_split(path)
+
+    should_split = mode in {"1", "true", "yes", "force"}
+    if mode == "auto":
+        should_split = metadata_requests_split
+    if not should_split:
+        return rho_up, rho_down, grad_up, grad_down
+
+    density_total = rho_up + rho_down
+    grad_total = grad_up + grad_down
+    print(
+        "Restricted closed-shell density split enabled: "
+        f"{os.path.basename(path)} N_up={n_up:.8f}, N_down={n_down:.8f}, N_tot={total:.8f}, "
+        f"minor/total={float(population_ratio):.3e}, minor/major_peak={float(peak_ratio):.3e}"
+    )
+    return (
+        0.5 * density_total,
+        0.5 * density_total,
+        0.5 * grad_total,
+        0.5 * grad_total,
+    )
+
+
+def _restricted_metadata_requests_closed_shell_split(path):
+    """Return True when QUEST plot metadata declares restricted one-channel storage."""
+    try:
+        density_file = h5py.File(path, "r")
+    except Exception:
+        return False
+    try:
+        attrs = getattr(density_file, "attrs", {})
+        spin_treatment = _metadata_text(attrs.get("spin_treatment", "")).upper()
+        rho_convention = _metadata_text(attrs.get("rho_channel_convention", "")).lower()
+    finally:
+        density_file.close()
+    return rho_convention == "restricted_total_in_rho0" or (
+        spin_treatment == "RESTRICTED" and "restricted_total" in rho_convention
+    )
+
+
+def _metadata_text(value):
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _build_radial_grid():
@@ -573,33 +719,68 @@ def _j_gga_kernel(s, x):
 
 def _compute_exchange_holes(grid, radial, fields, status=None):
     if status is not None:
-        _log_substep(status, "Preparing exchange kernels and spin-scaled radii.")
+        _log_substep(
+            status,
+            "Preparing exchange kernels and spin-scaled radii. "
+            f"(grid={grid.density_total.size}, radial={radial.npts}, threads={model_thread_count()}).",
+        )
     spin_scale_up = (1 + fields.zeta) ** (1 / 3) * fields.kf
     spin_scale_down = (1 - fields.zeta) ** (1 / 3) * fields.kf
-    x_up = np.outer(radial.exchange_u, spin_scale_up)
-    x_down = np.outer(radial.exchange_u, spin_scale_down)
     spin_density_up = (2 * grid.rho_up) ** 2
     spin_density_down = (2 * grid.rho_down) ** 2
 
+    chunk_size = radial_chunk_size()
+    chunk_count = radial_chunk_count(radial.npts)
+    chunk_mib = chunk_memory_estimate_mib(chunk_size, grid.density_total.size)
+    workers = effective_worker_count(chunk_count, chunk_mib)
     if status is not None:
-        _log_substep(status, "Contracting weighted exchange profiles over the grid.")
-    hx_lda = finite_or_zero(
-        (
-            (_j_lda_kernel(x_up) * spin_density_up + _j_lda_kernel(x_down) * spin_density_down)
-            @ grid.grid_weights
+        _log_substep(
+            status,
+            "Contracting weighted exchange profiles over the grid "
+            f"in {chunk_count} chunks of {chunk_size} radial points "
+            f"(workers={workers}, estimated chunk workspace={chunk_mib:.1f} MiB).",
         )
-        / (2 * grid.normalizer)
-    )
-    hx_pbe = finite_or_zero(
-        (
+    hx_lda = np.zeros(radial.npts, dtype=float)
+    hx_pbe = np.zeros(radial.npts, dtype=float)
+
+    def compute_chunk(bounds):
+        start, end = bounds
+        chunk_start = time.monotonic()
+        x_up = np.outer(radial.exchange_u[start:end], spin_scale_up)
+        x_down = np.outer(radial.exchange_u[start:end], spin_scale_down)
+        hx_lda_chunk = finite_or_zero(
             (
-                _j_gga_kernel(fields.s_up[np.newaxis, :], x_up) * spin_density_up
-                + _j_gga_kernel(fields.s_down[np.newaxis, :], x_down) * spin_density_down
+                (_j_lda_kernel(x_up) * spin_density_up + _j_lda_kernel(x_down) * spin_density_down)
+                @ grid.grid_weights
             )
-            @ grid.grid_weights
+            / (2 * grid.normalizer)
         )
-        / (2 * grid.normalizer)
-    )
+        hx_pbe_chunk = finite_or_zero(
+            (
+                (
+                    _j_gga_kernel(fields.s_up[np.newaxis, :], x_up) * spin_density_up
+                    + _j_gga_kernel(fields.s_down[np.newaxis, :], x_down) * spin_density_down
+                )
+                @ grid.grid_weights
+            )
+            / (2 * grid.normalizer)
+        )
+        return start, end, hx_lda_chunk, hx_pbe_chunk, chunk_start
+
+    chunks = list(radial_chunk_slices(radial.npts))
+    if workers == 1:
+        results = map(compute_chunk, chunks)
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        results = executor.map(compute_chunk, chunks)
+    try:
+        for chunk_index, (start, end, hx_lda_chunk, hx_pbe_chunk, chunk_start) in enumerate(results, start=1):
+            hx_lda[start:end] = hx_lda_chunk
+            hx_pbe[start:end] = hx_pbe_chunk
+            _log_chunk_progress(status, "exchange", chunk_index, chunk_count, start, end, chunk_start)
+    finally:
+        if workers != 1:
+            executor.shutdown()
     return hx_lda, hx_pbe
 
 
@@ -730,6 +911,92 @@ def _interpolate_cutoff(v, cumulative_values):
     return vc
 
 
+def _correlation_chunk_terms(radial_u, fields, correlation_energy):
+    stable_radial_u = np.maximum(radial_u, CORRELATION_U_ZERO)
+    v = np.outer(stable_radial_u, fields.phi * fields.ks)
+    v_sq = v**2
+    radial_scale = np.outer(stable_radial_u, safe_divide(fields.kf, fields.phi))
+    exp_factor = safe_negexp(fields.correlation_d[np.newaxis, :] * radial_scale**2)
+    active_grid = fields.active_total[np.newaxis, :]
+    lda_correlation_kernel = _lda_correlation_kernel(
+        v,
+        v_sq,
+        exp_factor,
+        fields,
+        correlation_energy,
+        active_grid,
+    )
+    phi_ks_factor = (fields.phi**5 * fields.ks**2)[np.newaxis, :]
+    nc_lsd = finite_or_zero(phi_ks_factor * lda_correlation_kernel)
+    gga_correction_kernel = _gga_correction_kernel(v_sq, fields, active_grid)
+    gga_hole = finite_or_zero(lda_correlation_kernel + (fields.t**2)[np.newaxis, :] * gga_correction_kernel)
+    nc_gea = finite_or_zero(phi_ks_factor * gga_hole)
+    return v, v_sq, nc_lsd, gga_hole, nc_gea
+
+
+def _find_gga_cutoff(radial, fields, correlation_energy, status=None):
+    ngrid = fields.active_total.size
+    previous_v = None
+    previous_integrand = None
+    previous_cumulative = np.zeros(ngrid, dtype=float)
+    left_v = np.zeros(ngrid, dtype=float)
+    right_v = np.zeros(ngrid, dtype=float)
+    left_cumulative = np.zeros(ngrid, dtype=float)
+    right_cumulative = np.zeros(ngrid, dtype=float)
+    has_crossing = np.zeros(ngrid, dtype=bool)
+
+    chunk_count = radial_chunk_count(radial.npts, minimum=2)
+    for chunk_index, (start, end) in enumerate(radial_chunk_slices(radial.npts, minimum=2), start=1):
+        chunk_start = time.monotonic()
+        v, v_sq, _, gga_hole, _ = _correlation_chunk_terms(radial.u_axis[start:end], fields, correlation_energy)
+        integrand = finite_or_zero(v_sq * gga_hole)
+
+        if previous_v is not None:
+            v_ext = np.vstack((previous_v[np.newaxis, :], v))
+            integrand_ext = np.vstack((previous_integrand[np.newaxis, :], integrand))
+            cumulative_ext = previous_cumulative[np.newaxis, :] + CUMTRAPZ(
+                integrand_ext,
+                v_ext,
+                axis=0,
+                initial=0,
+            )
+        else:
+            v_ext = v
+            cumulative_ext = CUMTRAPZ(integrand, v, axis=0, initial=0)
+
+        cumulative_ext = finite_or_zero(cumulative_ext)
+        sign_change = np.isfinite(cumulative_ext[1:]) & np.isfinite(cumulative_ext[:-1])
+        sign_change &= cumulative_ext[1:] * cumulative_ext[:-1] < 0
+        candidate_rows = np.arange(1, cumulative_ext.shape[0])[:, np.newaxis]
+        last_crossing = np.max(np.where(sign_change, candidate_rows, 0), axis=0)
+        crossing_columns = np.nonzero(last_crossing)[0]
+        if crossing_columns.size:
+            right_index = last_crossing[crossing_columns]
+            left_index = right_index - 1
+            left_v[crossing_columns] = v_ext[left_index, crossing_columns]
+            right_v[crossing_columns] = v_ext[right_index, crossing_columns]
+            left_cumulative[crossing_columns] = cumulative_ext[left_index, crossing_columns]
+            right_cumulative[crossing_columns] = cumulative_ext[right_index, crossing_columns]
+            has_crossing[crossing_columns] = True
+
+        previous_v = v[-1].copy()
+        previous_integrand = integrand[-1].copy()
+        previous_cumulative = cumulative_ext[-1].copy()
+        _log_chunk_progress(status, "correlation cutoff", chunk_index, chunk_count, start, end, chunk_start)
+
+    vc = np.zeros(ngrid, dtype=float)
+    denominator = right_cumulative - left_cumulative
+    good = has_crossing & np.isfinite(left_v) & np.isfinite(right_v)
+    good &= np.isfinite(left_cumulative) & np.isfinite(right_cumulative)
+    correction = safe_divide(left_cumulative * (right_v - left_v), denominator, where=good)
+    vc[good] = np.where(
+        np.abs(denominator[good]) > DENOM_FLOOR,
+        left_v[good] - correction[good],
+        right_v[good],
+    )
+    return finite_or_zero(vc)
+
+
 def _compute_correlation_holes(grid, radial, fields, status=None):
     if status is not None:
         _log_substep(status, "Evaluating PW92/LDA correlation ingredients.")
@@ -743,38 +1010,53 @@ def _compute_correlation_holes(grid, radial, fields, status=None):
         + (ec_1 - ec_0) * spin_factor * fields.zeta**4
     )
 
-    v = np.outer(radial.u_axis, fields.phi * fields.ks)
-    v_sq = v**2
-    radial_scale = np.outer(radial.u_axis, safe_divide(fields.kf, fields.phi))
-    exp_factor = safe_negexp(fields.correlation_d[np.newaxis, :] * radial_scale**2)
-    active_grid = fields.active_total[np.newaxis, :]
-
-    lda_correlation_kernel = _lda_correlation_kernel(
-        v,
-        v_sq,
-        exp_factor,
-        fields,
-        correlation_energy,
-        active_grid,
-    )
-    phi_ks_factor = (fields.phi**5 * fields.ks**2)[np.newaxis, :]
-    nc_lsd = finite_or_zero(phi_ks_factor * lda_correlation_kernel)
-    hc_lda = finite_or_zero(((nc_lsd * grid.density_total[np.newaxis, :]) @ grid.grid_weights) / grid.normalizer)
-
     if status is not None:
-        _log_substep(status, "Building the GGA correction and radial cutoff.")
-    gga_correction_kernel = _gga_correction_kernel(v_sq, fields, active_grid)
-    gga_hole = finite_or_zero(lda_correlation_kernel + (fields.t**2)[np.newaxis, :] * gga_correction_kernel)
-    nc_gea = finite_or_zero(phi_ks_factor * gga_hole)
+        _log_substep(
+            status,
+            "Building the GGA correction and radial cutoff in "
+            f"{radial_chunk_count(radial.npts, minimum=2)} memory-bounded chunks.",
+        )
+    vc = _find_gga_cutoff(radial, fields, correlation_energy, status=status)
 
-    cumulative_hole = finite_or_zero(CUMTRAPZ(finite_or_zero(v_sq * gga_hole), v, axis=0, initial=0))
-    vc = _interpolate_cutoff(v, cumulative_hole)
-
-    nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
-    nc_gga[:, ~fields.active_total] = 0.0
+    chunk_size = radial_chunk_size()
+    chunk_count = radial_chunk_count(radial.npts)
+    chunk_mib = chunk_memory_estimate_mib(chunk_size, grid.density_total.size, arrays=5)
+    workers = effective_worker_count(chunk_count, chunk_mib)
     if status is not None:
-        _log_substep(status, "Contracting correlation profiles over the grid.")
-    hc_pbe = finite_or_zero(((nc_gga * grid.density_total[np.newaxis, :]) @ grid.grid_weights) / grid.normalizer)
+        _log_substep(
+            status,
+            "Contracting correlation profiles over the grid "
+            f"in {chunk_count} chunks of {chunk_size} radial points "
+            f"(workers={workers}, estimated chunk workspace={chunk_mib:.1f} MiB).",
+        )
+    hc_lda = np.zeros(radial.npts, dtype=float)
+    hc_pbe = np.zeros(radial.npts, dtype=float)
+    density_weights = grid.density_total * grid.grid_weights
+
+    def compute_chunk(bounds):
+        start, end = bounds
+        chunk_start = time.monotonic()
+        v, _, nc_lsd, _, nc_gea = _correlation_chunk_terms(radial.u_axis[start:end], fields, correlation_energy)
+        hc_lda_chunk = finite_or_zero((nc_lsd @ density_weights) / grid.normalizer)
+        nc_gga = np.where(v <= vc[np.newaxis, :], nc_gea, 0.0)
+        nc_gga[:, ~fields.active_total] = 0.0
+        hc_pbe_chunk = finite_or_zero((nc_gga @ density_weights) / grid.normalizer)
+        return start, end, hc_lda_chunk, hc_pbe_chunk, chunk_start
+
+    chunks = list(radial_chunk_slices(radial.npts))
+    if workers == 1:
+        results = map(compute_chunk, chunks)
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        results = executor.map(compute_chunk, chunks)
+    try:
+        for chunk_index, (start, end, hc_lda_chunk, hc_pbe_chunk, chunk_start) in enumerate(results, start=1):
+            hc_lda[start:end] = hc_lda_chunk
+            hc_pbe[start:end] = hc_pbe_chunk
+            _log_chunk_progress(status, "correlation", chunk_index, chunk_count, start, end, chunk_start)
+    finally:
+        if workers != 1:
+            executor.shutdown()
     return hc_lda, hc_pbe
 
 
