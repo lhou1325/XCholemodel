@@ -1,147 +1,205 @@
-# LDA-regressive algebraic-tail coupled hole
+# LDA-regressive, cusp-preserving algebraic-tail coupled hole
 
-This note supersedes the unconstrained `n_c=w_x(1-Q)` construction when exact pointwise recovery of the PW92/LDA correlation hole at `t=0` is required.
+This note supersedes the first positive-screen construction when the correlation model must recover an LDA correlation-hole profile at `t=0`, preserve the PBE on-top value and cusp, and cancel a `u^-4` exchange tail without making the combined model hole positive.
 
-## Required local moments
+## Local moment convention
 
 For an angle-averaged local hole,
 
 ```text
-N_alpha = 4*pi*integral u^2 n_alpha(u) du
-E_alpha = 2*pi*integral u   n_alpha(u) du
+N_alpha       = 4*pi*integral_0^infinity u^2 n_alpha(u) du
+Epsilon_alpha = 2*pi*integral_0^infinity u   n_alpha(u) du.
 ```
 
-The target values are
+The targets are
 
 ```text
-N_x=-1, N_c=0, N_xc=-1
-E_x=epsilon_x^PBE, E_c=epsilon_c^PBE.
+N_x=-1, N_c=0, N_xc=-1,
+Epsilon_x=epsilon_x^PBE,
+Epsilon_c=epsilon_c^PBE.
 ```
 
-The model also preserves the PW92/PBE correlation on-top value and cusp, uses no radial step cutoff, and imposes `n_xc<=0` as a model-admissibility condition.
+The `2*pi` energy prefactor contains the pair-counting factor. The `4*pi` prefactor belongs to the particle moment.
 
-## Compatibility theorem
+Pointwise `n_xc<=0` is imposed as a model-admissibility condition. It is not asserted to be a universal theorem for every exact spatially resolved hole.
 
-Write `n_x=-w_x` with `w_x>=0`. Exact pointwise LDA regression and `n_xc<=0` at `t=0` require
+## 1. Constraint-exact LDA reference
+
+The rounded constants in the conventional PW92/LDA correlation-hole representation leave small numerical particle- and energy-moment drifts. Define
 
 ```text
-w_x(u) >= n_c^LDA(u)
+h_c^L(v) = h_c^PW92(v)
+         + alpha v^2 exp(-a v^2)
+         + beta  v^2 exp(-b v^2),
+a=p/2, b=2p.
 ```
 
-where the LDA correlation hole is positive. Therefore every possible exchange companion must satisfy
+`alpha` and `beta` are obtained from the two linear equations
 
 ```text
-P_plus = 4*pi*integral u^2 max(n_c^LDA,0) du <= 1
-X_plus = 2*pi*integral u   max(n_c^LDA,0) du <= -epsilon_x^PBE.
+integral v^2 Delta h_c^L(v) dv = - integral v^2 h_c^PW92(v) dv,
+2*pi*phi^3 integral v Delta h_c^L(v) dv
+    = epsilon_c^PW92 - 2*pi*phi^3 integral v h_c^PW92(v) dv.
 ```
 
-If either inequality fails, exact PW92/LDA regression, exact exchange moments, and pointwise `n_xc<=0` cannot coexist, independent of parameterization. The reference implementation raises a dedicated incompatibility error in that low-density domain rather than silently changing an energy or clipping a profile.
+The correction starts at `O(v^2)` and is exponentially localized. It therefore leaves the correlation on-top value, one-sided electron-electron cusp, and positive `v^-4` tail unchanged. The finite-gradient model has an explicit `t=0` branch that returns this LDA reference point by point.
 
-## Sign-safe exchange companion
+## 2. Why exchange must be repaired jointly
 
-Inside the compatible domain, form a smooth positive-lobe majorant
+Let the parent exchange hole be `n_x^parent=-w_parent`. The fixed parent LDA exchange profile is not pointwise large enough to dominate the positive part of the fixed LDA correlation profile for every separation. Consequently, exact LDA correlation regression and pointwise `n_xc<=0` cannot both be obtained by changing correlation alone.
+
+A smooth positive LDA-correlation majorant is used:
 
 ```text
-b_delta(u) = 0.5*[c_L(u) + sqrt(c_L(u)^2 + delta^2*w_L(u)^2*S(k_F*u)^2)]
-S(x) = exp[-(x_a/x)^4] for x>0, S(0)=0.
+c_+(u) = 0.5*[c_L(u) + sqrt(c_L(u)^2 + (eta*w_L(u))^2)],
+eta = 1.0e-3.
 ```
 
-The flat activation leaves the exchange on-top behavior unchanged. Add a scaled, short-range parent GGA exchange core
+It is nonnegative and is never smaller than `max(c_L,0)`. The LDA exchange weight `w_L` supplies the correct algebraic radial scale, so the smoothing does not introduce a constant tail.
+
+The repaired exchange weight is
 
 ```text
-r_0(u) = w_x^parent(u) exp[-(k_F*u/L_x)^4]
-r(u)   = A_x r_0(B_x u)
-w_x    = b_delta + r.
+w_x(u) = c_+(u)
+       + A_x w_parent(u) exp[-(k_F*u/L_x)^4].
 ```
 
-`A_x` and `B_x` are analytic functions of the residual particle and PBE exchange-energy budgets. The resulting `w_x` is nonnegative, majorizes the exact LDA correlation profile, and has exact exchange particle and energy moments.
+The positive parameters `A_x` and `L_x` are solved from
 
-## Exact-LDA coupled weight
+```text
+4*pi*integral u^2 w_x(u) du = 1,
+2*pi*integral u   w_x(u) du = -epsilon_x^PBE.
+```
+
+Thus `n_x=-w_x` remains nonpositive and has the exact exchange particle and energy moments. The exchange modification is a material part of the requested strict-sign model and is reported explicitly rather than hidden as a numerical patch.
+
+## 3. Exact LDA screen
 
 Define
 
 ```text
-g(u) = w_x(u) - n_c^LDA(u) >= 0.
+Q_L(u) = 1 - c_L(u)/w_x(u).
 ```
 
-For `x=k_F*u`, use
+The majorant guarantees `Q_L(u)>0`, and
 
 ```text
-tau(t) = t/sqrt(1+t^2)
-f_in(x)  = x^2/(0.5^2+x^2)
-f_out(x) = x^2/(4^2+x^2)
-F_m(x;t) = T_m(tau*x) exp[theta_in*f_in + theta_out*f_out].
+c_L(u) = w_x(u)[1-Q_L(u)].
 ```
 
-Algebraic gates are
+This identity is the LDA-regression anchor.
+
+## 4. Finite-gradient algebraic gate
+
+For `x=k_F*u`, define
 
 ```text
-T_2(z)=1/(1+z^2)
-T_4(z)=1/(1+z^4)
-T_6(z)=1/(1+z^6).
+tau(t) = t/sqrt(1+t^2),
+G_m(x,t) = 1/[1+(tau*x)^m],  m=2,4,6.
 ```
 
-The final profiles are
+The moment-transport basis functions are
 
 ```text
-n_x  = -w_x
-n_xc = -g F_m
-n_c  =  w_x - g F_m.
+b_s(x) = (e/4)  x^2 exp[-(x/2)^2],
+b_m(x) = (e/36) x^2 exp[-(x/6)^2].
 ```
 
-Because `g>=0` and `F_m>0`, `n_xc<=0` is exact without clipping.
-
-## Exact LDA limit and short range
-
-At `t=0`, set `theta_in=theta_out=0`; then `tau=0`, `T_m=1`, and
+Both are bounded, vanish with zero first derivative at the origin, and vanish at infinity. The positive screen is
 
 ```text
-n_c(u;0) = w_x(u) - g(u) = n_c^LDA(u)
+Q(u) = Q_L(u) G_m(k_F*u,t)
+       [1 + theta_s b_s(k_F*u) + theta_m b_m(k_F*u)].
 ```
 
-pointwise. Both basis functions are `O(u^2)`, and every gate has `T_m(0)=1`, `T_m'(0)=0`. Since the exchange weight has zero radial derivative at the origin, the correlation on-top value and cusp are exactly the PW92/PBE values for every `t`.
+The bracket is required to remain strictly positive. A state is rejected if the positivity certificate fails; no clipping is used.
 
-## Moment equations
-
-The two coefficients are determined from
+The final holes are
 
 ```text
-4*pi*integral u^2 g(u) F_m(u) du = 1
-2*pi*integral u   g(u) F_m(u) du = -(epsilon_x^PBE+epsilon_c^PBE).
+n_x(u)  = -w_x(u),
+n_c(u)  =  w_x(u)[1-Q(u)],
+n_xc(u) = -w_x(u)Q(u).
 ```
 
-The implementation calibrates these equations to the exact ungated moments and quadratures only `g(F_m-1)`. This removes the finite-grid LDA-tail offset and makes both coefficients vanish continuously as `t->0`.
+Therefore `n_x+n_c=n_xc` pointwise and `n_xc<0` wherever `w_x Q` is nonzero.
 
-## Tail cancellation
+## 5. Moment equations
 
-For the selected quartic gate,
+The two coefficients are obtained from the linear weighted-moment equations
 
 ```text
-w_x ~ C_x/u^4
-g   ~ C_g/u^4
-F_4 ~ const/u^4
+4*pi*integral u^2 w_x(u) Q(u) du = 1,
+2*pi*integral u   w_x(u) Q(u) du
+    = -(epsilon_x^PBE+epsilon_c^PBE).
 ```
 
-and therefore
+With the exchange moments already fixed, these equations imply
 
 ```text
-n_x  ~ -C_x/u^4
-n_c  ~  C_x/u^4 - D/u^8 > 0
-n_xc ~             -D/u^8 < 0.
+N_c=0,
+Epsilon_c=epsilon_c^PBE.
 ```
 
-Thus the positive correlation tail cancels the leading exchange `u^-4` term while leaving a smaller negative coupled tail. The quadratic and sextic gates produce `u^-6` and `u^-10` coupled tails. The quartic gate is selected because it is the lowest even gate that does not alter the gate itself through `O(u^2)` and gives the requested `u^-8` residual.
+## 6. LDA limit, on-top value, and cusp
 
-## Scaled-LDA diagnostic
+At `t=0`, the implementation returns `n_c=c_L` directly. Hence LDA regression is exact point by point rather than only in its moments.
 
-The particle-sum-preserving scaled LDA form
+For nonzero `t`, `G_m(0,t)=1` and `G_m'(0,t)=0`; the two basis functions start at `O(u^2)`. The constant and linear radial terms of `w_x(1-Q)` are therefore identical to those of `c_L`. The PW92/PBE correlation on-top value and one-sided cusp are unchanged.
+
+A nonzero cusp is incompatible with a globally `C-infinity` even extension through `u=0`. The physically compatible regularity is the exact one-sided cusp at the origin and `C-infinity` dependence for every `u>0`, without a finite-radius cutoff.
+
+## 7. Tail cancellation
+
+For the selected quartic gate, suppose
 
 ```text
-n_c^lambda(u)=lambda^3 n_c^LDA(lambda*u)
+n_x(u) = -C_x/u^4 + o(u^-4).
 ```
 
-has energy, on-top value, and cusp proportional to `lambda`, `lambda^3`, and `lambda^4`. Choosing `lambda=epsilon_c^PBE/epsilon_c^LDA` recovers the PBE correlation energy but violates both short-range anchors unless `lambda=1`. It can be used as an auxiliary shape ingredient, not as the complete constrained model.
+The LDA reference screen tends to a finite positive algebraic scale, while
 
-## Validation artifact
+```text
+G_4(k_F*u,t) ~ const/u^4.
+```
 
-The separate reproducibility package contains the full reference implementation, XCholemodel grid adapter, 48-state train/validation audit, three algebraic families, ten regression-test groups, figures, generated CSV data, and the compiled manuscript. The selected quartic model gives maximum correlation-particle residual `1.166e-14`, maximum PBE correlation-energy error `1.582e-15 Ha/e`, zero sampled positive combined hole, and maximum pointwise `t=0` LDA-profile error `1.110e-16` over the audited domain.
+Consequently,
+
+```text
+n_c(u)  = +C_x/u^4 - D/u^8 + o(u^-8) > 0,
+n_xc(u) =             -D/u^8 + o(u^-8) < 0.
+```
+
+The correlation tail cancels the leading exchange `u^-4` term while leaving a smaller negative combined tail. The quadratic and sextic gates produce `u^-6` and `u^-10` combined tails. The quartic gate is selected because it gives the requested `u^-8` residual and does not alter the gate itself through quadratic order at the origin.
+
+## 8. Scaled-LDA diagnostic
+
+The particle-preserving scaled form
+
+```text
+c_lambda(u)=lambda^3 c_L(lambda*u)
+```
+
+has
+
+```text
+Epsilon[c_lambda] = lambda Epsilon[c_L],
+c_lambda(0)       = lambda^3 c_L(0),
+c_lambda'(0)      = lambda^4 c_L'(0).
+```
+
+Choosing `lambda=epsilon_c^PBE/epsilon_c^LDA` matches the PBE correlation energy but violates the on-top and cusp constraints unless `lambda=1`. Scaled LDA is therefore retained as a diagnostic ingredient, not as the complete model.
+
+## 9. Current validation artifact
+
+The separate reproducibility package contains the complete reference implementation, XCholemodel grid adapter, generated data, ten vector figures, nine constraint-test groups, LaTeX source, and a 14-page compiled manuscript.
+
+The compact descriptor audit contains eight finite-gradient states over three distinct `(r_s,zeta,phi)` environments. For the selected quartic model:
+
+- maximum correlation-particle residual: `5.551115e-16`;
+- maximum PBE correlation-energy residual in the construction equations: `6.938894e-18 Ha/electron`;
+- maximum independently represented PBE exchange-energy residual: `1.004363e-12 Ha/electron`;
+- maximum sampled positive combined hole: `0`;
+- representative tail-ratio error `|n_c/(-n_x)-1|`: `7.072121e-14`.
+
+Independent segmented infinite-range quadrature for `(r_s,zeta,s,t)=(2,0.4,1.2,1)` gives correlation-particle error `1.836313e-15` and exchange/correlation energy errors of approximately `1.0e-12 Ha/electron` with opposite signs. All nine regression-test groups pass.
