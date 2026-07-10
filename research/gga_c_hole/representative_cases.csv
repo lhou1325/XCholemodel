@@ -1,0 +1,11 @@
+class,label,rs,zeta,phi,t,target_pbe_ha_per_e,legacy_sharp_ha_per_e,legacy_error_mha_per_e
+local,dense_unpolarized,0.5,0.0,1.0000,0.5,-0.0803720,-0.0757410,4.631
+local,valence_unpolarized,2.0,0.0,1.0000,1.0,-0.0447595,-0.0508433,-6.084
+local,diffuse_unpolarized,5.0,0.0,1.0000,2.0,-0.0159549,-0.0260588,-10.104
+local,moderate_spin,2.0,0.5,0.9710,1.0,-0.0403227,-0.0453097,-4.987
+local,strong_spin,2.0,0.9,0.8747,1.0,-0.0352589,-0.0338692,1.390
+atomic,He,,,,,-0.0401421,-0.0430043,-2.862
+atomic,Li,,,,,-0.0482670,-0.0495371,-1.270
+atomic,Be,,,,,-0.0515313,-0.0519564,-0.425
+atomic,N,,,,,-0.0565533,-0.0524704,4.083
+atomic,Ne,,,,,-0.0624743,-0.0558762,6.598
